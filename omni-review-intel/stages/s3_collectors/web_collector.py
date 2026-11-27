@@ -405,8 +405,6 @@ async def _fetch_html_and_markdown(url: str) -> tuple[str, str]:
     html = ""
     markdown = ""
 
-    loop = asyncio.get_running_loop()
-
     def _fetch_chrome():
         sess = create_chrome_session(timeout=min(settings.request_timeout, 18))
         if sess is None:
@@ -424,7 +422,7 @@ async def _fetch_html_and_markdown(url: str) -> tuple[str, str]:
             except Exception:
                 pass
 
-    status, html = await loop.run_in_executor(None, _fetch_chrome)
+    status, html = await asyncio.to_thread(_fetch_chrome)
     if html:
         markdown = _html_to_clean_text(html)
 
@@ -591,18 +589,17 @@ async def collect_web(
     comments: list[RawComment] = []
     seen_keys: set[str] = set()
     collector_name = "web_scraper"
-    loop = asyncio.get_running_loop()
 
     # Layer 1: Twitter / X JSON endpoints (bypasses X login/JS requirement cleanly)
     if source.platform == "Twitter" or _TWEET_RE.search(source.url):
-        tw_comments = await loop.run_in_executor(None, _collect_twitter_sync, source, limit)
+        tw_comments = await asyncio.to_thread(_collect_twitter_sync, source, limit)
         if tw_comments:
             comments.extend(tw_comments[:limit] if limit is not None else tw_comments)
             collector_name = "fxtwitter_api"
 
     # Layer 2: Discourse forum `.json` topic API
     if not comments and "/t/" in urlparse(source.url).path:
-        disc_comments = await loop.run_in_executor(None, _collect_discourse_json_sync, source, limit)
+        disc_comments = await asyncio.to_thread(_collect_discourse_json_sync, source, limit)
         if disc_comments:
             comments.extend(disc_comments[:limit] if limit is not None else disc_comments)
             collector_name = "discourse_json"

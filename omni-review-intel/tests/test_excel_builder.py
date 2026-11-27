@@ -435,3 +435,37 @@ class TestExcelBuilder:
         assert Path(p1).exists()
         assert Path(p2).exists()
         assert p1 != p2
+
+    def test_excel_handles_formula_injection_in_notes_and_aspects(self, tmp_path, sample_sources, sample_comments):
+        review = ExecutiveReview(
+            topic_name="Safe Notes Product",
+            original_url="https://example.com",
+            overall_sentiment="Positive",
+            ai_score_out_of_10=8.0,
+            executive_summary="Clean summary",
+            top_pros=["Fast"],
+            top_cons=["None"],
+            platform_comparison_notes="=HYPERLINK(\"http://bad\")\x04",
+            buying_or_action_verdict="Good",
+            aspect_summaries=[
+                AspectSummary(
+                    aspect_name="=Aspect\x01",
+                    mention_count=3,
+                    positive_pct=100.0,
+                    neutral_pct=0.0,
+                    negative_pct=0.0,
+                    key_takeaway="=CMD()\x07",
+                )
+            ],
+        )
+        xlsx_path = build_excel(review=review, sources=sample_sources, analyzed_comments=sample_comments, output_dir=str(tmp_path))
+        wb = load_workbook(xlsx_path, data_only=False)
+        ws_exec = wb["Executive Review"]
+        # Last populated row in Executive Review is Platform Findings (col B)
+        notes_cell = ws_exec.cell(row=ws_exec.max_row, column=2)
+        assert notes_cell.data_type == "s"
+        assert str(notes_cell.value).startswith("=HYPERLINK")
+        ws_plat = wb["Platform & Aspect Summary"]
+        asp_cell = ws_plat.cell(row=ws_plat.max_row, column=6)
+        assert asp_cell.data_type == "s"
+        assert asp_cell.value == "=CMD()"

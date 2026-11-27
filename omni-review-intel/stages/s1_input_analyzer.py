@@ -110,7 +110,6 @@ async def _fetch_yt_metadata_http(url: str) -> dict | None:
     if not vid_m:
         return None
     vid = vid_m.group(1)
-    loop = asyncio.get_event_loop()
 
     def _fetch() -> dict | None:
         import html as html_lib
@@ -169,7 +168,7 @@ async def _fetch_yt_metadata_http(url: str) -> dict | None:
                 pass
         return None
 
-    return await loop.run_in_executor(None, _fetch)
+    return await asyncio.to_thread(_fetch)
 
 
 def _extract_ig_headline(raw_title: str, raw_desc: str, uploader: str = "") -> tuple[str, str]:
@@ -217,7 +216,6 @@ async def _fetch_ig_metadata_http(url: str) -> dict | None:
     shortcode = _extract_shortcode(url)
     if not shortcode:
         return None
-    loop = asyncio.get_event_loop()
 
     def _fetch() -> dict | None:
         try:
@@ -263,7 +261,7 @@ async def _fetch_ig_metadata_http(url: str) -> dict | None:
             logger.debug(f"Instagram HTTP metadata fallback failed for {url}: {e}")
         return None
 
-    return await loop.run_in_executor(None, _fetch)
+    return await asyncio.to_thread(_fetch)
 
 
 async def _extract_video_metadata(url: str) -> dict:
@@ -290,13 +288,12 @@ async def _extract_video_metadata(url: str) -> dict:
         "nocheckcertificate": True,
         "extractor_args": {"youtube": {"player_client": ["mweb", "tv_embedded", "android", "ios", "web"]}},
     }
-    loop = asyncio.get_event_loop()
     try:
         def _extract() -> dict:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False) or {}
 
-        info: dict = await loop.run_in_executor(None, _extract)
+        info: dict = await asyncio.to_thread(_extract)
         raw_title = (info.get("title") or "").strip()
         if raw_title.lower().startswith("mix - "):
             raw_title = raw_title[6:].strip()
@@ -326,7 +323,7 @@ async def _extract_video_metadata(url: str) -> dict:
     if http_meta:
         return http_meta
     if _FB_RE.search(url) or _TT_RE.search(url):
-        text_meta = await loop.run_in_executor(None, _scrape_html_chrome_sync, url)
+        text_meta = await asyncio.to_thread(_scrape_html_chrome_sync, url)
         if text_meta:
             meta_dict = {"title": url, "description": "", "tags": [], "transcript_excerpt": "", "uploader": ""}
             for ln in text_meta.splitlines():
@@ -345,14 +342,15 @@ def _clean_flipkart_or_ecommerce_title(raw_title: str) -> str:
     import html as html_lib
 
     title = html_lib.unescape(raw_title or "").strip()
+    title = re.sub(r"\s*Price\s+in\s+India\b.*$", "", title, flags=re.IGNORECASE)
     title = re.sub(
-        r"\s*(?:\|\s*Flipkart\.com|:\s*Amazon\.[a-z.]+|-\s*Amazon\.[a-z.]+|Reviews:\s*Latest Review of.*)$",
+        r"\s*(?:[:|]\s*Flipkart\.com|[:|-]\s*Amazon\.[a-z.]+|Reviews:\s*Latest Review of.*)$",
         "",
         title,
         flags=re.IGNORECASE,
     )
-    title = re.sub(r"\s*Buy Online at Best Price.*$", "", title, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\s*(?:-\s*)?Buy\s+Online\s+at\s+Best\s+Price.*$", "", title, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", title).strip(" -|:")
 
 
 def _scrape_html_chrome_sync(url: str) -> str:
@@ -444,8 +442,7 @@ def _scrape_html_chrome_sync(url: str) -> str:
 
 async def _scrape_html_fallback(url: str) -> str:
     """Extract readable page metadata using Chrome TLS impersonation, falling back to aiohttp."""
-    loop = asyncio.get_running_loop()
-    chrome_res = await loop.run_in_executor(None, _scrape_html_chrome_sync, url)
+    chrome_res = await asyncio.to_thread(_scrape_html_chrome_sync, url)
     if chrome_res:
         return chrome_res
 
@@ -513,7 +510,6 @@ async def _serpapi_lens_urls(image_url: str) -> list[str]:
     """Use Google Lens (SerpApi) to find visual-match URLs for an image."""
     if not (settings.has_serpapi and _SERPAPI_AVAILABLE):
         return []
-    loop = asyncio.get_event_loop()
     try:
         def _search() -> list[str]:
             params = {
@@ -526,7 +522,7 @@ async def _serpapi_lens_urls(image_url: str) -> list[str]:
             visual_matches = results.get("visual_matches", [])
             return [m.get("link", "") for m in visual_matches if m.get("link")]
 
-        urls = await loop.run_in_executor(None, _search)
+        urls = await asyncio.to_thread(_search)
         return [u for u in urls if u][:10]
     except Exception as e:
         logger.warning(f"SerpApi Lens failed: {e}")
@@ -639,14 +635,18 @@ def _fallback_topic_profile(content_text: str, input_type: InputType, url: str) 
     clean_q_topic = re.sub(r"\s+", " ", clean_q_topic).strip()
     q_words = clean_q_topic.split()
     if len(q_words) > 6:
-        clean_q_topic = " ".join(q_words[:6])
+        q_words = q_words[:6]
+    while len(q_words) > 2 and q_words[-1].lower() in {"with", "for", "and", "or", "in", "on", "of", "to", "by", "the", "a", "an"}:
+        q_words.pop()
+    clean_q_topic = " ".join(q_words)
     clean_q_topic = clean_q_topic or re.sub(r"\s+", " ", re.sub(r"[^\w\s&'.-]", " ", title)).strip() or title
+    short_q = " ".join(q_words[:3]) if len(q_words) > 4 else clean_q_topic
 
     search_queries = [
-        f"{clean_q_topic} review",
-        f"{clean_q_topic} reddit worth it",
+        f"{short_q} review",
+        f"{short_q} reddit worth it",
         f"{clean_q_topic} complaints problems",
-        f"{clean_q_topic} youtube in depth review",
+        f"{short_q} youtube in depth review",
         f"{clean_q_topic} pros and cons",
     ]
 

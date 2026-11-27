@@ -639,7 +639,8 @@ def _build_sheet_executive(
     c1.font = _font(bold=True, size=10)
     c1.border = _border()
 
-    c2 = ws.cell(row=curr_row, column=2, value=review.platform_comparison_notes or "Consistent reception across all crawled sources.")
+    c2 = ws.cell(row=curr_row, column=2)
+    _set_safe_cell(c2, review.platform_comparison_notes or "Consistent reception across all crawled sources.")
     c2.fill = _fill(C_WHITE)
     c2.font = _font(size=10)
     c2.alignment = _left(wrap=True)
@@ -773,7 +774,8 @@ def _build_sheet_platform(
             asp.key_takeaway,
         ]
         for col_idx, val in enumerate(asp_vals, start=1):
-            cell = ws.cell(row=asp_row, column=col_idx, value=val)
+            cell = ws.cell(row=asp_row, column=col_idx)
+            _set_safe_cell(cell, val)
             cell.fill = alt_fill
             cell.border = _border()
             cell.font = _font(size=10)

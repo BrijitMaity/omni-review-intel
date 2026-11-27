@@ -503,7 +503,6 @@ async def _collect_via_innertube_curl(
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    loop = asyncio.get_event_loop()
     last_error_note = ""
 
     def _new_session(profile_idx: int = 0) -> tuple[Any, int]:
@@ -965,7 +964,7 @@ async def _collect_via_innertube_curl(
         return comments
 
     try:
-        comments = await loop.run_in_executor(None, _fetch)
+        comments = await asyncio.to_thread(_fetch)
         if comments:
             source.scrape_status = "success"
             source.collector_used = "youtube_innertube"
@@ -993,8 +992,6 @@ async def _collect_via_downloader(
     except ImportError:
         return [], source
 
-    loop = asyncio.get_event_loop()
-
     def _call():
         d = YoutubeCommentDownloader()
         d.session.headers.update({
@@ -1020,7 +1017,7 @@ async def _collect_via_downloader(
         return results
 
     try:
-        raw_list = await loop.run_in_executor(None, _call)
+        raw_list = await asyncio.to_thread(_call)
         comments: list[RawComment] = []
         for i, c in enumerate(raw_list):
             text = (c.get("text") or "").strip()
@@ -1061,8 +1058,6 @@ async def _collect_via_ytdlp(
     except ImportError:
         return [], source
 
-    loop = asyncio.get_event_loop()
-
     def _call():
         yt_args: dict[str, Any] = {
             "player_client": ["visionos", "mweb", "tv_embedded", "android", "ios", "web"],
@@ -1081,13 +1076,14 @@ async def _collect_via_ytdlp(
             "quiet": True,
             "no_warnings": True,
             "nocheckcertificate": True,
+            "socket_timeout": max(settings.request_timeout, 15),
             "extractor_args": {"youtube": yt_args},
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(source.url, download=False)
 
     try:
-        info = await loop.run_in_executor(None, _call)
+        info = await asyncio.to_thread(_call)
         raw_list = (info or {}).get("comments") or []
         comments: list[RawComment] = []
         limit = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
@@ -1121,8 +1117,6 @@ async def _collect_via_api(
     video_id: str, source: DiscoveredSource
 ) -> tuple[list[RawComment], DiscoveredSource]:
     """Use YouTube Data API v3 to fetch up to MAX_COMMENTS_PER_URL comments."""
-    loop = asyncio.get_event_loop()
-
     def _fetch():
         try:
             from googleapiclient.discovery import build
@@ -1170,7 +1164,7 @@ async def _collect_via_api(
         return comments
 
     try:
-        comments = await loop.run_in_executor(None, _fetch)
+        comments = await asyncio.to_thread(_fetch)
         source.scrape_status = "success"
         source.collector_used = "youtube_data_api_v3"
         source.comments_collected = len(comments)

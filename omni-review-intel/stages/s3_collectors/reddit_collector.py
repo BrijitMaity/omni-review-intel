@@ -53,8 +53,6 @@ async def collect_reddit(
 
     submission_id = _extract_submission_id(source.url)
 
-    loop = asyncio.get_event_loop()
-
     def _fetch():
         try:
             import praw
@@ -97,7 +95,7 @@ async def collect_reddit(
         return comments
 
     try:
-        comments = await loop.run_in_executor(None, _fetch)
+        comments = await asyncio.to_thread(_fetch)
         source.scrape_status = "success"
         source.collector_used = "praw"
         source.comments_collected = len(comments)
@@ -126,7 +124,6 @@ async def _collect_via_public_json(
         clean_url = f"{base_clean}?limit=500&raw_json=1"
 
     data = None
-    loop = asyncio.get_running_loop()
 
     def _fetch_chrome():
         sess = create_chrome_session(timeout=15)
@@ -146,14 +143,17 @@ async def _collect_via_public_json(
         return None
 
     try:
-        data = await loop.run_in_executor(None, _fetch_chrome)
+        data = await asyncio.to_thread(_fetch_chrome)
         if data is None:
-            connector = aiohttp.TCPConnector()
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"}
-            async with aiohttp.ClientSession(connector=connector, headers=headers) as sess:
-                async with sess.get(clean_url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
+            try:
+                connector = aiohttp.TCPConnector()
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"}
+                async with aiohttp.ClientSession(connector=connector, headers=headers) as sess:
+                    async with sess.get(clean_url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+            except Exception as aio_err:
+                logger.debug(f"Reddit aiohttp JSON fallback failed for {clean_url}: {aio_err}")
 
         comments: list[RawComment] = []
         seen_keys: set[str] = set()
@@ -194,6 +194,63 @@ async def _collect_via_public_json(
             source.collector_used = "reddit_public_json"
             source.comments_collected = len(comments)
             return comments, source
+
+        # HTML fallback: Reddit's server-rendered <shreddit-comment> elements when .json returns 403
+        def _fetch_html() -> str:
+            sess = create_chrome_session(timeout=15)
+            if sess is None:
+                return ""
+            try:
+                r = sess.get(
+                    base_clean,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
+                )
+                return str(r.text or "") if r.status_code == 200 else ""
+            except Exception:
+                return ""
+            finally:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+        html_text = await asyncio.to_thread(_fetch_html)
+        if html_text and "shreddit-comment" in html_text:
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(html_text, "html.parser")
+            for idx, node in enumerate(soup.select("shreddit-comment")):
+                if limit is not None and len(comments) >= limit:
+                    break
+                body_el = (
+                    node.select_one('[slot="comment"]')
+                    or node.select_one('div[id$="-comment-rtjson-content"]')
+                    or node.select_one(".md")
+                )
+                body = body_el.get_text(" ", strip=True) if body_el else ""
+                if not body or body in ("[deleted]", "[removed]"):
+                    continue
+                ts_el = node.select_one("faceplate-timeago, time")
+                pub = str(ts_el.get("ts") or ts_el.get("datetime") or "") if ts_el else ""
+                append_unique_comment(
+                    comments=comments,
+                    seen_keys=seen_keys,
+                    comment_id=str(node.get("thingid") or f"red_html_{submission_id}_{idx}"),
+                    author=str(node.get("author") or "RedditUser"),
+                    text=body,
+                    published_date=pub,
+                    rating=None,
+                    platform="Reddit",
+                    source=source,
+                )
+            if comments:
+                source.scrape_status = "success"
+                source.collector_used = "reddit_public_html"
+                source.comments_collected = len(comments)
+                return comments, source
     except Exception as e:
-        logger.debug(f"Public Reddit JSON fetch failed for {source.url}: {e}")
+        logger.debug(f"Public Reddit fetch failed for {source.url}: {e}")
     return [], source

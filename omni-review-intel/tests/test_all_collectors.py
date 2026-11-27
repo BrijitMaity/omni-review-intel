@@ -652,3 +652,99 @@ def test_discovery_and_web_skip_corporate_landings_and_sso():
 
     assert cmts == []
     assert updated.scrape_status == "failed"
+
+
+def test_reddit_public_html_shreddit_fallback(tmp_path):
+    """Verify collect_reddit falls back to <shreddit-comment> HTML when Reddit .json returns 403."""
+    from types import SimpleNamespace
+    from core.cache import Cache
+    from core.schemas import DiscoveredSource
+    from stages.s3_collectors.reddit_collector import collect_reddit
+
+    src = DiscoveredSource(
+        url="https://www.reddit.com/r/headphones/comments/w65b33/sony_wh1000xm5_review/",
+        platform="Reddit",
+        title="Sony WH-1000XM5 Review",
+        is_target=True,
+    )
+    html_payload = """
+    <html><body>
+      <shreddit-comment thingid="t1_abc" author="audiophile99">
+        <faceplate-timeago ts="2025-04-01T10:00:00Z"></faceplate-timeago>
+        <div slot="comment"><p>Best ANC for flights, zero complaints so far.</p></div>
+      </shreddit-comment>
+      <shreddit-comment thingid="t1_def" author="deleted_user">
+        <div slot="comment"><p>[removed]</p></div>
+      </shreddit-comment>
+    </body></html>
+    """
+
+    class _FakeSess:
+        def get(self, url, **kwargs):
+            if url.endswith(".json?limit=500&raw_json=1") or ".json" in url:
+                return SimpleNamespace(status_code=403, text="blocked", json=lambda: {})
+            return SimpleNamespace(status_code=200, text=html_payload)
+
+        def close(self):
+            pass
+
+    fresh_cache = Cache(db_path=str(tmp_path / "reddit_test.db"))
+
+    async def _run():
+        with (
+            patch("stages.s3_collectors.reddit_collector.get_cache", return_value=fresh_cache),
+            patch("stages.s3_collectors.reddit_collector.settings.reddit_client_id", ""),
+            patch("stages.s3_collectors.reddit_collector.settings.reddit_client_secret", ""),
+            patch("stages.s3_collectors._http_utils.create_chrome_session", return_value=_FakeSess()),
+        ):
+            return await collect_reddit(src)
+
+    cmts, updated = asyncio.run(_run())
+    assert len(cmts) == 1
+    assert cmts[0].author == "audiophile99"
+    assert "Best ANC for flights" in cmts[0].original_text
+    assert cmts[0].published_date.startswith("2025-04-01")
+    assert updated.scrape_status == "success"
+    assert updated.collector_used == "reddit_public_html"
+
+
+def test_stage2_youtube_review_fallback_discovers_relevant_videos():
+    """When web search adapters return empty/junk, Stage 2 discovers YouTube review videos cleanly."""
+    from types import SimpleNamespace
+    from stages.s2_web_discovery import _search_youtube_reviews
+
+    fake_payload = {
+        "contents": {
+            "twoColumnSearchResultsRenderer": {
+                "primaryContents": {
+                    "itemSectionRenderer": {
+                        "contents": [
+                            {
+                                "videoRenderer": {
+                                    "videoId": "6CsJZxfZsL0",
+                                    "title": {"runs": [{"text": "Sony WH-1000XM5 Review"}]},
+                                    "ownerText": {"runs": [{"text": "Marques Brownlee"}]},
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    html = f"<script>var ytInitialData = {json.dumps(fake_payload)};</script>"
+
+    class _FakeSess:
+        def get(self, url, **kwargs):
+            return SimpleNamespace(status_code=200, text=html)
+
+        def close(self):
+            pass
+
+    with patch("stages.s3_collectors._http_utils.create_chrome_session", return_value=_FakeSess()):
+        res = asyncio.run(_search_youtube_reviews("Sony WH-1000XM5 review", max_results=3))
+
+    assert len(res) == 1
+    assert res[0]["url"] == "https://www.youtube.com/watch?v=6CsJZxfZsL0"
+    assert "Sony WH-1000XM5 Review" in res[0]["title"]
+    assert "Marques Brownlee" in res[0]["snippet"]

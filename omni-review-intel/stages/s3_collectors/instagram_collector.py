@@ -731,7 +731,6 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
             }
         )
 
-    loop = asyncio.get_running_loop()
     comments: list[RawComment] = []
     total_reported = 0
     collector_name = "instagram_public_html"
@@ -741,8 +740,8 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
     # Layer 2: Optional authenticated session cookie pagination
     session_id = _normalize_session_id(settings.instagram_session_id)
     if session_id:
-        res = await loop.run_in_executor(
-            None, _collect_via_session_api_sync, source, shortcode, session_id, max_items
+        res = await asyncio.to_thread(
+            _collect_via_session_api_sync, source, shortcode, session_id, max_items
         )
         comments = res["comments"]
         total_reported = res["total_reported"]
@@ -751,8 +750,8 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
 
     # Layer 3: Zero-key public HTML embedded JSON extraction
     if not comments:
-        html, _final_url, _csrf = await loop.run_in_executor(
-            None, _fetch_post_html_sync, source.url, shortcode, ""
+        html, _final_url, _csrf = await asyncio.to_thread(
+            _fetch_post_html_sync, source.url, shortcode, ""
         )
         if html:
             parsed = _parse_public_html_data(html, shortcode, source)
@@ -763,8 +762,8 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
 
     # Layer 4: yt-dlp fallback for reels/videos
     if not comments:
-        yt_comments = await loop.run_in_executor(
-            None, _collect_via_ytdlp_ig_sync, source.url, shortcode, source, max_items
+        yt_comments = await asyncio.to_thread(
+            _collect_via_ytdlp_ig_sync, source.url, shortcode, source, max_items
         )
         if yt_comments:
             comments = yt_comments

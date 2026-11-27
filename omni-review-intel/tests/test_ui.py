@@ -257,9 +257,29 @@ def test_ui_blocks_unsafe_private_and_local_urls(app_test):
     assert at.session_state["analysis_state"] is None
 
 
+def test_ui_renders_zero_comment_state_and_escapes_html(app_test, tmp_path):
+    """Ensure 0-comment fallback states and <script>/<tags> in review text render without errors or raw HTML tags."""
+    state = _sample_state(tmp_path, count=0)
+    state.executive_review = state.executive_review.model_copy(
+        update={
+            "executive_summary": "Users wrote <script>alert(1)</script> & <3 great audio!",
+            "top_pros": ["<b>Crisp highs</b> & <3 bass"],
+            "buying_or_action_verdict": "Check <img src=x onerror=alert(1)> safely",
+        }
+    )
+    app_test.session_state["analysis_state"] = state
+    at = app_test.run()
+    assert len(at.exception) == 0
+    md_joined = "\n".join(m.value for m in at.markdown)
+    assert "<script>alert(1)</script>" not in md_joined
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in md_joined
+    assert "<img src=x onerror=alert(1)>" not in md_joined
+
+
 @pytest.mark.asyncio
 async def test_scoped_settings_isolate_public_visitor_secrets():
     """Verify per-session keys/caps stay isolated inside scoped_settings without mutating globals."""
+    import asyncio
     from config import has_scoped_override, scoped_settings, settings
 
     orig_ig = settings.instagram_session_id
@@ -277,6 +297,9 @@ async def test_scoped_settings_isolate_public_visitor_secrets():
         assert settings.gemini_api_key == "visitor_gem_secret"
         assert settings.has_gemini is True
         assert settings.max_comments_per_url == 250
+        # Verify asyncio.to_thread propagates scoped_settings to blocking collectors
+        assert await asyncio.to_thread(lambda: settings.max_comments_per_url) == 250
+        assert await asyncio.to_thread(lambda: settings.instagram_session_id) == "visitor_ig_secret"
 
     assert has_scoped_override() is False
     assert settings.instagram_session_id == orig_ig

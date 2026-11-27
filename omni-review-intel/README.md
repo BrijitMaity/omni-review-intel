@@ -58,17 +58,19 @@ The system runs out-of-the-box in **Smart Built-in Mode** without external API k
 
 ---
 
-## 📊 Corporate Excel Report Structure (7 Dedicated Tabs)
+## 📊 Corporate Excel Report Structure (Up to 9 Dedicated Tabs)
 
 | Tab # | Sheet Name | Contents & Purpose |
 |:---:|---|---|
 | **1** | **All Reviews & Comments** | **Active Tab on open**: Complete uncapped master table of all scraped comments with sentiment pills, star ratings, author, date, aspect, and source hyperlinks. |
-| **2** | **👍 Good Reviews** | Filtered positive customer reviews, praise, and satisfaction highlights. |
-| **3** | **👎 Bad Reviews** | Filtered negative customer complaints, product issues, defects, and criticisms. |
-| **4** | **⚖️ Neutral Reviews** | Filtered objective feedback, feature queries, and neutral community discussions. |
-| **5** | **Executive Review** | C-suite summary dashboard with AI Review Score (1–10), Pros/Cons/Verdict, and **Embedded Pie Chart**. |
-| **6** | **Platform & Aspect Summary** | Platform metrics breakdown, aspect breakdown (Price, Battery, Comfort, etc.), and **Embedded Bar Chart**. |
-| **7** | **Discovered Sources** | Complete verified audit log of all crawled web URLs with status indicators and hyperlinks. |
+| **2** | **🎯 Target Reviews** | Comments/reviews scraped strictly from the primary target URL (unmixed). |
+| **3** | **👍 Good Reviews** | Filtered positive customer reviews, praise, and satisfaction highlights. |
+| **4** | **👎 Bad Reviews** | Filtered negative customer complaints, product issues, defects, and criticisms. |
+| **5** | **⚖️ Neutral Reviews** | Filtered objective feedback, feature queries, and neutral community discussions. |
+| **6** | **🌐 Discovered Web Reviews** | Additional context collected from web discovery sources (when available). |
+| **7** | **Executive Review** | C-suite summary dashboard with AI Review Score (1–10), Pros/Cons/Verdict, and **Embedded Pie Chart**. |
+| **8** | **Platform & Aspect Summary** | Platform metrics breakdown, aspect breakdown (Price, Battery, Comfort, etc.), and **Embedded Bar Chart**. |
+| **9** | **Discovered Sources** | Complete verified audit log of all crawled web URLs with status indicators and hyperlinks. |
 
 ---
 
@@ -77,8 +79,10 @@ The system runs out-of-the-box in **Smart Built-in Mode** without external API k
 ```bash
 python -m pytest -v
 ```
-All 74 unit, integration, and UI tests execute with 100% pass rate.X"
 
+### CLI Usage Examples
+
+```bash
 # Product page
 python main.py --url "https://www.amazon.com/dp/XXXXXXXX"
 
@@ -98,18 +102,7 @@ python main.py --url "https://..." --verbose
 streamlit run app.py
 ```
 
-Open `http://localhost:8501`, paste a URL, and click **Run Analysis**.
-
----
-
-## 📊 Excel Report Structure
-
-| Sheet | Contents |
-|-------|----------|
-| **Executive Review** | KPI summary, Pros/Cons/Verdict, embedded Pie Chart |
-| **Platform & Aspect Summary** | Sentiment per platform/aspect, embedded Bar Chart |
-| **Discovered Sources** | Audit log with clickable hyperlinks and status colors |
-| **All Reviews & Comments** | Full dataset with auto-filter, frozen header, conditional colors |
+Open `http://localhost:8501`, paste a URL, and click **Analyze**.
 
 ---
 

@@ -54,8 +54,6 @@ async def collect_apify(
         source.error_message = f"No Apify actor for platform '{source.platform}'"
         return [], source
 
-    loop = asyncio.get_event_loop()
-
     def _run_actor():
         try:
             from apify_client import ApifyClient
@@ -72,7 +70,7 @@ async def collect_apify(
         return items
 
     try:
-        items = await loop.run_in_executor(None, _run_actor)
+        items = await asyncio.to_thread(_run_actor)
     except Exception as e:
         logger.error(f"Apify actor failed for {source.url}: {e}")
         source.scrape_status = "failed"

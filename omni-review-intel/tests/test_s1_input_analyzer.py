@@ -93,3 +93,20 @@ def test_instagram_metadata_and_brand_fallback():
     assert "Jennifer Barreto" in profile.canonical_name
     assert profile.brand == "BBC News"
     assert profile.category == "Video & Social Media"
+
+
+def test_flipkart_long_title_cleaning_and_concise_search_queries():
+    from stages.s1_input_analyzer import _clean_flipkart_or_ecommerce_title, _fallback_topic_profile
+
+    raw = (
+        "SONY WH-1000XM5 Wireless Noise Cancellation with AI Noise Reduction Bluetooth "
+        "Price in India - Buy SONY WH-1000XM5 Online - SONY : Flipkart.com"
+    )
+    cleaned = _clean_flipkart_or_ecommerce_title(raw)
+    assert "Price in India" not in cleaned
+    assert "Flipkart.com" not in cleaned
+    assert cleaned.startswith("SONY WH-1000XM5")
+
+    profile = _fallback_topic_profile(f"Title: {cleaned}\n\nContent:\nGreat audio", "product", "https://www.flipkart.com/sony-wh-1000xm5/p/itm123")
+    assert all(not q.endswith("with review") for q in profile.search_queries)
+    assert any(q.startswith("SONY WH-1000XM5") and q.endswith("review") for q in profile.search_queries)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import weakref
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qs
 
 from loguru import logger
@@ -229,7 +230,6 @@ async def _search_tavily(query: str) -> list[dict]:
     TavilyClient = _try_import_tavily()
     if not (settings.has_tavily and TavilyClient):
         return []
-    loop = asyncio.get_event_loop()
     try:
         def _call():
             client = TavilyClient(api_key=settings.tavily_api_key)
@@ -237,7 +237,7 @@ async def _search_tavily(query: str) -> list[dict]:
                 query=query, search_depth="basic", max_results=5, include_domains=[]
             )
             return resp.get("results", [])
-        results = await loop.run_in_executor(None, _call)
+        results = await asyncio.to_thread(_call)
         return [{"url": r.get("url", ""), "title": r.get("title", ""), "snippet": r.get("content", "")} for r in results]
     except Exception as e:
         logger.warning(f"Tavily search failed for '{query}': {e}")
@@ -248,7 +248,6 @@ async def _search_serpapi(query: str) -> list[dict]:
     GoogleSearch = _try_import_serpapi()
     if not (settings.has_serpapi and GoogleSearch):
         return []
-    loop = asyncio.get_event_loop()
     try:
         def _call():
             params = {
@@ -260,17 +259,24 @@ async def _search_serpapi(query: str) -> list[dict]:
             search = GoogleSearch(params)
             results = search.get_dict().get("organic_results", [])
             return [{"url": r.get("link", ""), "title": r.get("title", ""), "snippet": r.get("snippet", "")} for r in results]
-        return await loop.run_in_executor(None, _call)
+        return await asyncio.to_thread(_call)
     except Exception as e:
         logger.warning(f"SerpApi search failed for '{query}': {e}")
         return []
+
+
+_DDG_SEMS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
 
 
 async def _search_duckduckgo(query: str) -> list[dict]:
     DDGS = _try_import_duckduckgo()
     if not DDGS:
         return []
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
+    ddg_sem = _DDG_SEMS.get(loop)
+    if ddg_sem is None:
+        ddg_sem = asyncio.Semaphore(2)
+        _DDG_SEMS[loop] = ddg_sem
     try:
         def _call():
             with DDGS() as ddgs:
@@ -278,9 +284,76 @@ async def _search_duckduckgo(query: str) -> list[dict]:
                 kwargs = {"region": "us-en", "max_results": 5} if is_ascii else {"max_results": 5}
                 results = list(ddgs.text(query, **kwargs))
             return [{"url": r.get("href", ""), "title": r.get("title", ""), "snippet": r.get("body", "")} for r in results]
-        return await loop.run_in_executor(None, _call)
+        async with ddg_sem:
+            return await asyncio.to_thread(_call)
     except Exception as e:
         logger.debug(f"DuckDuckGo search failed for '{query}': {e}")
+        return []
+
+
+async def _search_youtube_reviews(query: str, max_results: int = 4) -> list[dict]:
+    """Zero-key fallback discovering relevant YouTube review videos via YouTube search HTML."""
+    import json
+    from stages.s3_collectors._http_utils import create_chrome_session
+
+    def _call() -> list[dict]:
+        sess = create_chrome_session(timeout=12)
+        if sess is None:
+            return []
+        try:
+            resp = sess.get("https://www.youtube.com/results", params={"search_query": query})
+            if resp.status_code != 200 or not resp.text:
+                return []
+            marker = re.search(r"ytInitialData\s*=\s*\{", resp.text)
+            if not marker:
+                return []
+            idx = resp.text.index("{", marker.start())
+            data, _ = json.JSONDecoder().raw_decode(resp.text, idx)
+            out: list[dict] = []
+            seen_vids: set[str] = set()
+
+            def _walk(obj):
+                if len(out) >= max_results:
+                    return
+                if isinstance(obj, dict):
+                    if "videoRenderer" in obj:
+                        vr = obj["videoRenderer"]
+                        vid = str(vr.get("videoId") or "").strip()
+                        title = "".join(
+                            x.get("text", "") for x in ((vr.get("title") or {}).get("runs") or [])
+                            if isinstance(x, dict)
+                        ).strip()
+                        channel = "".join(
+                            x.get("text", "") for x in ((vr.get("ownerText") or {}).get("runs") or [])
+                            if isinstance(x, dict)
+                        ).strip()
+                        if vid and title and vid not in seen_vids:
+                            seen_vids.add(vid)
+                            out.append({
+                                "url": f"https://www.youtube.com/watch?v={vid}",
+                                "title": title,
+                                "snippet": f"YouTube review by {channel}" if channel else "YouTube review video",
+                            })
+                    for v in obj.values():
+                        _walk(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _walk(item)
+
+            _walk(data)
+            return out
+        except Exception as exc:
+            logger.debug(f"YouTube HTML search note for {query!r}: {exc}")
+            return []
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    try:
+        return await asyncio.to_thread(_call)
+    except Exception:
         return []
 
 
@@ -312,7 +385,7 @@ async def discover_sources(
     """
     topic_kw = _topic_keywords(topic)
     cache = get_cache()
-    cache_key = f"s2_v4::{input_url}::{topic.canonical_name}::{settings.max_discovered_urls}"
+    cache_key = f"s2_v5::{input_url}::{topic.canonical_name}::{settings.max_discovered_urls}"
     cached = cache.get("s2_sources", cache_key)
     if cached:
         logger.info("Stage 2: cache hit")
@@ -379,6 +452,15 @@ async def discover_sources(
     # Search results
     for item in raw_results:
         _add(item.get("url", ""), title=item.get("title", ""), snippet=item.get("snippet", ""))
+
+    # Zero-key YouTube review video fallback when web search engines yield sparse results
+    if input_platform != "YouTube" and len(sources) < 4 and topic.search_queries:
+        yt_hits = await _search_youtube_reviews(
+            topic.search_queries[0],
+            max_results=min(4, max(1, settings.max_discovered_urls - len(sources))),
+        )
+        for item in yt_hits:
+            _add(item.get("url", ""), title=item.get("title", ""), snippet=item.get("snippet", ""))
 
     # Cap
     sources = sources[: settings.max_discovered_urls]

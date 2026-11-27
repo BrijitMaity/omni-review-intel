@@ -150,22 +150,30 @@ def _heuristic_analyze_comment(
         elif raw.rating == 3.0 and pos_score == neg_score:
             sentiment = "Neutral"
 
-    # Aspect Detection
+    # Aspect Detection (whole-word matching avoids false hits like "performance" -> "ANC")
     aspect_tag = "General"
-    if any(k in text for k in ("battery", "charge", "charging", "charger", "mah", "runtime")):
+    if re.search(r"\b(?:battery|batteries|charge|charging|charger|mah|runtime|backup)\b", text):
         aspect_tag = "Battery"
-    elif any(k in text for k in ("sound", "bass", "audio", "mic", "microphone", "volume", "music", "treble", "anc", "noise")):
-        aspect_tag = "ANC" if "anc" in text else "Sound Quality"
-    elif any(k in text for k in ("comfort", "comfortable", "fit", "ear", "ears", "headband", "clamp", "heavy", "lightweight")):
+    elif re.search(r"\banc\b|noise cancel", text):
+        aspect_tag = "ANC"
+    elif re.search(r"\b(?:sound|bass|audio|mic|microphone|volume|treble|speaker|speakers|vocals|acoustic)\b", text):
+        aspect_tag = "Sound Quality"
+    elif re.search(r"\b(?:camera|cameras|photo|photos|lens|selfie|megapixel|video quality)\b", text):
+        aspect_tag = "Camera"
+    elif re.search(r"\b(?:comfort|comfortable|ergonomic|fit|ear|ears|headband|clamp|lightweight|cushion)\b", text):
         aspect_tag = "Comfort"
-    elif any(k in text for k in ("build", "quality", "hinge", "plastic", "durability", "material", "case", "scratch")):
+    elif re.search(r"\b(?:build|durability|hinge|hinges|plastic|metallic|material|sturdy|fragile|scratch)\b", text):
         aspect_tag = "Build Quality"
-    elif any(k in text for k in ("price", "cost", "expensive", "cheap", "worth", "value", "dollar", "money")):
+    elif re.search(r"\b(?:price|cost|expensive|cheap|worth|value|dollar|money|budget|overpriced)\b", text):
         aspect_tag = "Price"
-    elif any(k in text for k in ("design", "look", "looks", "color", "style", "aesthetic")):
+    elif re.search(r"\b(?:design|look|looks|color|style|aesthetic|appearance)\b", text):
         aspect_tag = "Design"
-    elif any(k in text for k in ("camera", "screen", "display", "speed", "fast", "lag", "software")):
+    elif re.search(r"\b(?:screen|display|speed|fast|lag|lags|fps|software|performance|smooth|heating)\b", text):
         aspect_tag = "Performance"
+    elif re.search(r"\b(?:delivery|shipping|packaging|support|service|refund|return|warranty|workplace|salary|culture|interview|hiring)\b", text):
+        aspect_tag = "Service & Experience"
+    elif re.search(r"\b(?:story|script|acting|episode|editing|lyrics|music|song|content|tutorial|explained|host|creator|comedy|joke)\b", text):
+        aspect_tag = "Content & Creative"
 
     is_spam = False
     spam_reason = ""
@@ -578,28 +586,48 @@ def _stub_review(
             "Individual user preferences vary by use-case",
         ]
 
+    is_product = topic.input_type == "product"
+    audience_noun = "customer reviews" if is_product else "public comments"
+    summary_noun = "customer sentiment" if is_product else "audience sentiment"
     exec_summary = (
         f"Aggregated cross-web review analysis for '{topic.canonical_name}'. "
-        f"Analyzed {total_valid} customer reviews and community discussions across web sources. "
-        f"Overall customer sentiment is {overall_sentiment} with an AI rating score of {ai_score:.1f}/10. "
+        f"Analyzed {total_valid:,} {audience_noun} and community discussions across web sources. "
+        f"Overall {summary_noun} is {overall_sentiment} with an AI rating score of {ai_score:.1f}/10. "
         f"Sentiment distribution: {pos_pct:.1f}% positive, {neu_pct:.1f}% neutral, and {neg_pct:.1f}% negative."
     )
 
-    if pos_pct >= 60.0:
-        verdict = (
-            f"Recommended purchase. {topic.canonical_name} achieves a high positive rating ({pos_pct:.1f}%) "
-            "with strong customer endorsement across online communities."
-        )
-    elif neg_pct >= 45.0:
-        verdict = (
-            f"Exercise caution. Recurring user complaints ({neg_pct:.1f}% negative) indicate potential reliability "
-            "or value trade-offs. Review the Cons in Sheet 1 and comments in Sheet 4 before purchasing."
-        )
+    if is_product:
+        if pos_pct >= 60.0:
+            verdict = (
+                f"Recommended purchase. {topic.canonical_name} achieves a high positive rating ({pos_pct:.1f}%) "
+                "with strong customer endorsement across online communities."
+            )
+        elif neg_pct >= 45.0:
+            verdict = (
+                f"Exercise caution before purchasing. Recurring user complaints ({neg_pct:.1f}% negative) indicate "
+                "potential reliability or value trade-offs. Inspect the Bad Reviews and All Reviews tabs for details."
+            )
+        else:
+            verdict = (
+                f"Balanced option. {topic.canonical_name} receives mixed-to-favorable feedback. "
+                "Best suited for buyers whose requirements match its highlighted strengths."
+            )
     else:
-        verdict = (
-            f"Balanced option. {topic.canonical_name} receives mixed-to-favorable feedback. "
-            "Best suited for buyers whose requirements match its highlighted strengths."
-        )
+        if pos_pct >= 60.0:
+            verdict = (
+                f"Strongly positive audience reception ({pos_pct:.1f}% positive). "
+                f"Viewers and community commenters respond favorably to {topic.canonical_name}."
+            )
+        elif neg_pct >= 45.0:
+            verdict = (
+                f"Critical audience reception ({neg_pct:.1f}% negative). "
+                "Review the Bad Reviews and All Reviews tabs for recurring viewer concerns and criticisms."
+            )
+        else:
+            verdict = (
+                f"Mixed-to-balanced public discussion around {topic.canonical_name} "
+                f"({pos_pct:.1f}% positive, {neu_pct:.1f}% neutral, {neg_pct:.1f}% negative)."
+            )
 
     return ExecutiveReview(
         topic_name=topic.canonical_name,

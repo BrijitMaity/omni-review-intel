@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import threading
+from html import escape as _h
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,7 +78,7 @@ def _sentiment_pill(sentiment: str) -> str:
     cls = {"Positive": "pill-pos", "Neutral": "pill-neu", "Negative": "pill-neg"}.get(
         sentiment, "pill-neu"
     )
-    return f'<span class="{cls}">{sentiment}</span>'
+    return f'<span class="{cls}">{_h(str(sentiment))}</span>'
 
 
 def _load_cloud_secrets() -> None:
@@ -101,6 +103,7 @@ def _load_cloud_secrets() -> None:
             "facebook_cookie",
         )
         raw_secrets = dict(st.secrets)
+        llm_key_updated = False
         for field_name in secret_keys:
             cur = str(getattr(_s, field_name, "") or "").strip()
             if cur:
@@ -108,6 +111,14 @@ def _load_cloud_secrets() -> None:
             val = raw_secrets.get(field_name.upper()) or raw_secrets.get(field_name) or ""
             if isinstance(val, str) and val.strip():
                 setattr(_s, field_name, val.strip())
+                if field_name in ("gemini_api_key", "openai_api_key"):
+                    llm_key_updated = True
+        if llm_key_updated:
+            try:
+                from stages._llm_client import get_llm_client
+                get_llm_client(force_refresh=True)
+            except Exception:
+                pass
     except Exception:
         # Safe no-op when running locally without secrets.toml or inside restricted sandboxes
         pass
@@ -458,12 +469,13 @@ if submitted:
                     latest_stage, latest_msg = s_next, m_next
                     log_lines.append(f"[{url_prefix}] [{s_next}] {m_next}")
 
-                log_text = "\n".join(log_lines[-20:])
+                log_text = _h("\n".join(log_lines[-20:]))
                 log_placeholder.markdown(
                     f'<div class="log-box">{log_text}</div>', unsafe_allow_html=True
                 )
 
-                stage_num = latest_stage.split("/")[0].replace("Stage ", "").strip()
+                m_stage = re.search(r"(\d+)", latest_stage)
+                stage_num = m_stage.group(1) if m_stage else ""
                 pct = stage_progress.get(stage_num, 0.0)
                 if latest_msg.startswith(("Topic identified", "Discovered", "Collected", "Analysis complete", "Report ready")):
                     pct = stage_progress.get(str(int(stage_num) + 1) if stage_num.isdigit() else stage_num, pct)
@@ -544,9 +556,9 @@ if st.session_state.analysis_state is not None:
         if state.topic:
             st.markdown(
                 f"<span class='meta-subtext'>"
-                f"<b>Brand:</b> {state.topic.brand or 'N/A'} &nbsp;|&nbsp; "
-                f"<b>Category:</b> {state.topic.category or 'N/A'} &nbsp;|&nbsp; "
-                f"<b>Type:</b> {state.topic.input_type.upper()}"
+                f"<b>Brand:</b> {_h(state.topic.brand or 'N/A')} &nbsp;|&nbsp; "
+                f"<b>Category:</b> {_h(state.topic.category or 'N/A')} &nbsp;|&nbsp; "
+                f"<b>Type:</b> {_h(state.topic.input_type.upper())}"
                 f"</span>",
                 unsafe_allow_html=True,
             )
@@ -680,7 +692,7 @@ if st.session_state.analysis_state is not None:
         with col_summary:
             # "Customers say" AI Review Insights Card
             chips_html = "".join(
-                f'<span class="aspect-tag-chip">🏷️ {a.aspect_name} ({a.positive_pct:.0f}% positive)</span>'
+                f'<span class="aspect-tag-chip">🏷️ {_h(a.aspect_name)} ({a.positive_pct:.0f}% positive)</span>'
                 for a in review.aspect_summaries[:6]
             )
             st.markdown(
@@ -691,7 +703,7 @@ if st.session_state.analysis_state is not None:
                     <span class="ai-badge">Analyzed from {state.total_comments_valid:,} public reviews</span>
                   </div>
                   <p class="ai-summary-text">
-                    {review.executive_summary}
+                    {_h(review.executive_summary)}
                   </p>
                   <div>{chips_html}</div>
                 </div>
@@ -702,7 +714,7 @@ if st.session_state.analysis_state is not None:
             # Pros & Cons Side-by-Side Cards
             c_pro, c_con = st.columns(2)
             with c_pro:
-                pro_bullets = "".join(f'<div class="pro-item">✔ {p}</div>' for p in review.top_pros)
+                pro_bullets = "".join(f'<div class="pro-item">✔ {_h(p)}</div>' for p in review.top_pros)
                 st.markdown(
                     f"""
                     <div class="pro-card">
@@ -713,12 +725,12 @@ if st.session_state.analysis_state is not None:
                     unsafe_allow_html=True,
                 )
             with c_con:
-                con_bullets = "".join(f'<div class="con-item">✘ {c}</div>' for c in review.top_cons)
+                con_bullets = "".join(f'<div class="con-item">✘ {_h(c)}</div>' for c in review.top_cons)
                 complaints_html = ""
                 if review.common_complaints:
                     complaints_html = (
                         "<div class='complaint-heading'>Frequent Complaints:</div>"
-                        + "".join(f'<div class="complaint-item">▸ {cp}</div>' for cp in review.common_complaints[:3])
+                        + "".join(f'<div class="complaint-item">▸ {_h(cp)}</div>' for cp in review.common_complaints[:3])
                     )
                 st.markdown(
                     f"""
@@ -737,8 +749,8 @@ if st.session_state.analysis_state is not None:
             f"""
             <div class="verdict-box">
               <div class="verdict-title">{verdict_heading}</div>
-              <p class="verdict-body">{review.buying_or_action_verdict}</p>
-              <span class="verdict-meta"><b>Platform Insights:</b> {review.platform_comparison_notes or 'Consistent sentiment across all crawled platforms.'}</span>
+              <p class="verdict-body">{_h(review.buying_or_action_verdict)}</p>
+              <span class="verdict-meta"><b>Platform Insights:</b> {_h(review.platform_comparison_notes or 'Consistent sentiment across all crawled platforms.')}</span>
             </div>
             """,
             unsafe_allow_html=True,

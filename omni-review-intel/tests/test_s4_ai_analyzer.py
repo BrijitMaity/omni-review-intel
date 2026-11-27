@@ -156,3 +156,44 @@ class TestReducePhaseHelpers:
             "Test Product",
         )
         assert emoji_pos.sentiment == "Positive"
+
+    def test_aspect_detection_avoids_anc_substring_false_positives_and_non_product_verdict(self):
+        from stages.s4_ai_analyzer import _heuristic_analyze_comment
+
+        c = _heuristic_analyze_comment(
+            RawComment(source_url="https://yt.com", original_text="Great performance and smooth software"),
+            "Some Phone",
+        )
+        assert c.aspect_tag == "Performance"
+
+        anc = _heuristic_analyze_comment(
+            RawComment(source_url="https://yt.com", original_text="ANC blocks airplane noise easily"),
+            "Test Headphones",
+        )
+        assert anc.aspect_tag == "ANC"
+
+        vid_topic = TopicProfile(
+            canonical_name="Music Video",
+            input_type="video",
+            search_queries=["music video review", "music video reddit", "music video comments"],
+        )
+        sample_c = [
+            AnalyzedComment(
+                comment_id="v1",
+                source_url="https://yt.com",
+                platform="YouTube",
+                original_text="Awesome editing and song!",
+                english_text="Awesome editing and song!",
+                sentiment="Positive",
+                confidence_score=0.9,
+                aspect_tag="Content & Creative",
+            )
+        ]
+        vid_review = _stub_review(
+            vid_topic,
+            "https://youtube.com/watch?v=test",
+            stats={"total": 1, "positive_pct": 100.0, "neutral_pct": 0.0, "negative_pct": 0.0},
+            comments=sample_c,
+        )
+        assert "purchase" not in vid_review.buying_or_action_verdict.lower()
+        assert "buyers" not in vid_review.buying_or_action_verdict.lower()

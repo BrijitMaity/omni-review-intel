@@ -230,15 +230,14 @@ async def collect_facebook(source: DiscoveredSource) -> tuple[list[RawComment], 
         )
         return restored, updated
 
-    loop = asyncio.get_running_loop()
-    res = await loop.run_in_executor(None, _collect_facebook_sync, source)
+    res = await asyncio.to_thread(_collect_facebook_sync, source)
     comments: list[RawComment] = res["comments"]
     total_reported: int = res["total_reported"]
     login_walled: bool = res["login_walled"]
     collector_name = "facebook_cookie_html" if settings.has_facebook_cookie else "facebook_public_html"
 
     if not comments:
-        yt_comments = await loop.run_in_executor(None, _collect_via_ytdlp_fb_sync, source, max_items)
+        yt_comments = await asyncio.to_thread(_collect_via_ytdlp_fb_sync, source, max_items)
         if yt_comments:
             comments = yt_comments
             collector_name = "facebook_ytdlp"

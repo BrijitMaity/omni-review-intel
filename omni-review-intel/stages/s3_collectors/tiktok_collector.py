@@ -249,14 +249,13 @@ async def collect_tiktok(source: DiscoveredSource) -> tuple[list[RawComment], Di
             )
             return apify_comments, final_source
 
-    loop = asyncio.get_running_loop()
-    res = await loop.run_in_executor(None, _collect_tiktok_sync, source, video_id, max_items)
+    res = await asyncio.to_thread(_collect_tiktok_sync, source, video_id, max_items)
     comments: list[RawComment] = res["comments"]
     total_reported: int = res["total_reported"]
     collector_name = "tiktok_comment_api"
 
     if not comments:
-        yt_comments = await loop.run_in_executor(None, _collect_via_ytdlp_tt_sync, source, max_items)
+        yt_comments = await asyncio.to_thread(_collect_via_ytdlp_tt_sync, source, max_items)
         if yt_comments:
             comments = yt_comments
             collector_name = "tiktok_ytdlp"

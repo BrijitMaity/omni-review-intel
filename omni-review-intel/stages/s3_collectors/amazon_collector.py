@@ -336,8 +336,7 @@ async def collect_amazon(source: DiscoveredSource) -> tuple[list[RawComment], Di
             )
             return apify_comments, final_source
 
-    loop = asyncio.get_running_loop()
-    res = await loop.run_in_executor(None, _collect_amazon_sync, source, asin, max_items)
+    res = await asyncio.to_thread(_collect_amazon_sync, source, asin, max_items)
     comments: list[RawComment] = res["comments"]
     total_reported: int = res["total_reported"]
     signin_walled: bool = res["signin_walled"]

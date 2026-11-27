@@ -121,7 +121,6 @@ class _GeminiClient:
         reraise=True,
     )
     async def generate(self, system: str, user: str, model_tier: str = "flash") -> str:
-        loop = asyncio.get_event_loop()
         model_name = self._model(model_tier)
 
         if self._mode == "sdk" and self._client and self._types:
@@ -141,7 +140,7 @@ class _GeminiClient:
                 return response.text or ""
 
             try:
-                return await loop.run_in_executor(None, _call)
+                return await asyncio.to_thread(_call)
             except Exception as e:
                 logger.debug(f"Gemini SDK call failed ({e}), falling back to direct REST")
                 return await self._call_rest(model=model_name, system=system, user=user)

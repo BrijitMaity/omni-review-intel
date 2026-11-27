@@ -306,8 +306,7 @@ async def collect_flipkart(source: DiscoveredSource) -> tuple[list[RawComment], 
             )
             return restored, updated
 
-    loop = asyncio.get_running_loop()
-    res = await loop.run_in_executor(None, _collect_flipkart_sync, source, max_items)
+    res = await asyncio.to_thread(_collect_flipkart_sync, source, max_items)
     comments: list[RawComment] = res["comments"]
     total_reported: int = res["total_reported"]
 
