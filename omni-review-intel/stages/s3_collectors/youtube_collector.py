@@ -87,7 +87,7 @@ async def collect_youtube(
     max_items: int | None = req_max if req_max > 0 else None
 
     cache = get_cache()
-    cache_key = f"yt_v4::{video_id}::{req_max}"
+    cache_key = f"yt_v5::{video_id}::{req_max}"
     cached = cache.get("s3_youtube", cache_key)
     if cached:
         if isinstance(cached, dict):
@@ -108,7 +108,7 @@ async def collect_youtube(
             else:
                 # Never get permanently stuck on an incomplete/partial cache when uncapped
                 cache_ok = cached_status != "partial" and (
-                    cached_expected <= 200 or len(cached_items) >= int(cached_expected * 0.70)
+                    cached_expected <= 200 or len(cached_items) >= int(cached_expected * 0.85)
                 )
 
         if cache_ok:
@@ -132,11 +132,9 @@ async def collect_youtube(
         comments, source = await _collect_via_innertube_curl(video_id, source, meta_out=meta_out)
         est_total = max(est_total, int(meta_out.get("est_total") or 0))
 
-    # Escalate and merge yt-dlp/downloader if InnerTube stopped severely short of YouTube's reported count
-    needs_more = not comments or (
-        est_total > 200
-        and len(comments) < int(min(max_items or est_total, est_total) * 0.70)
-    )
+    # Escalate and merge yt-dlp/downloader if InnerTube stopped short of YouTube's reported count
+    target_expected = min(max_items or est_total, est_total) if est_total > 0 else 0
+    needs_more = not comments or (est_total > 200 and len(comments) < int(target_expected * 0.90))
     if needs_more:
         dl_source = source.model_copy()
         dl_comments, dl_source = await _collect_via_downloader(video_id, dl_source)
@@ -146,10 +144,7 @@ async def collect_youtube(
             if len(comments) > before_n and not source.collector_used:
                 source.collector_used = dl_source.collector_used
 
-    needs_more_after_dl = not comments or (
-        est_total > 200
-        and len(comments) < int(min(max_items or est_total, est_total) * 0.70)
-    )
+    needs_more_after_dl = not comments or (est_total > 200 and len(comments) < int(target_expected * 0.80))
     if needs_more_after_dl:
         yt_source = source.model_copy()
         yt_comments, yt_source = await _collect_via_ytdlp(video_id, yt_source)
@@ -438,6 +433,11 @@ def _extract_innertube_page(
                         .get("continuationCommand", {})
                         .get("token")
                     )
+                if not tok:
+                    for cc in _search_dict(cir, "continuationCommand"):
+                        if isinstance(cc, dict) and cc.get("token"):
+                            tok = cc["token"]
+                            break
                 if tok:
                     decoded = urllib.parse.unquote(tok)
                     if decoded not in visited_tokens:
@@ -511,9 +511,11 @@ async def _collect_via_innertube_curl(
         if kind == "curl" and c_requests is not None:
             s = c_requests.Session(impersonate=variant, curl_options=_curl_opts)
             s.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
+            s.cookies.set("SOCS", "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg", domain=".youtube.com")
             return s, idx
         s = httpx.Client(timeout=20, follow_redirects=True, headers=_BROWSER_HEADERS)
         s.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
+        s.cookies.set("SOCS", "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg", domain=".youtube.com")
         return s, idx
 
     def _close_quietly(sess: Any) -> None:
@@ -598,16 +600,19 @@ async def _collect_via_innertube_curl(
         initial_token: str | None = None
         newest_token: str | None = None
 
-        # Step 1: Try standard /watch HTML across up to 2 profiles (curl_cffi -> httpx)
+        # Step 1: Try standard /watch and mobile m.youtube.com across profiles (curl_cffi -> httpx)
         watch_urls = [
             f"https://www.youtube.com/watch?v={video_id}",
             f"https://m.youtube.com/watch?v={video_id}",
         ]
-        for attempt_idx in range(min(2, len(profiles))):
+        for attempt_idx, target_watch_url in enumerate(watch_urls):
             try:
-                r = session.get(watch_urls[0], timeout=15)
+                r = session.get(target_watch_url, timeout=15)
                 final_url = str(getattr(r, "url", ""))
                 if r.status_code == 200 and r.text and "sorry/index" not in final_url:
+                    low_html = r.text.lower()
+                    if "confirm you\u2019re not a bot" in low_html or "confirm you're not a bot" in low_html or "sign in to confirm" in low_html:
+                        last_error_note = "YouTube bot-check rate-limited this server IP (add YOUTUBE_API_KEY in Settings/Secrets for cloud access)"
                     w_key, w_ver, w_data, w_vis = _extract_watch_init(r.text)
                     if w_data:
                         tok, nt = _extract_comment_bootstrap(w_data, allow_generic_fallback=True)
@@ -616,13 +621,14 @@ async def _collect_via_innertube_curl(
                             visitor_data = w_vis or visitor_data
                             est_total = max(est_total, _extract_est_total(w_data))
                             initial_token, newest_token = tok, nt
+                            last_error_note = ""
                             break
                 elif r.status_code in (403, 429) or "sorry/index" in final_url:
                     last_error_note = f"YouTube /watch HTTP {r.status_code} rate-limited"
             except Exception as e:
                 logger.debug(f"InnerTube GET watch attempt {attempt_idx + 1} failed: {e}")
 
-            if attempt_idx + 1 < min(2, len(profiles)):
+            if attempt_idx + 1 < len(watch_urls):
                 _close_quietly(session)
                 session, active_profile = _new_session(active_profile + 1)
 
@@ -661,9 +667,20 @@ async def _collect_via_innertube_curl(
             if visitor_data:
                 client_ctx["visitorData"] = visitor_data
             next_payload = {"context": {"client": client_ctx}, "videoId": video_id}
+            next_headers = {
+                "X-Youtube-Client-Name": "1",
+                "X-Youtube-Client-Version": client_version,
+                "Origin": "https://www.youtube.com",
+                "Referer": f"https://www.youtube.com/watch?v={video_id}",
+            }
+            if visitor_data:
+                next_headers["X-Goog-Visitor-Id"] = visitor_data
             for n_try in range(len(profiles)):
                 try:
-                    r_next = session.post(next_endpoint, json=next_payload, timeout=20)
+                    try:
+                        r_next = session.post(next_endpoint, json=next_payload, headers=next_headers, timeout=20)
+                    except TypeError:
+                        r_next = session.post(next_endpoint, json=next_payload, timeout=20)
                     if r_next.status_code == 200:
                         next_data = r_next.json()
                         vd = (next_data.get("responseContext") or {}).get("visitorData")
@@ -677,10 +694,11 @@ async def _collect_via_innertube_curl(
                             newest_token = nt
                             last_error_note = ""
                             break
-                    else:
+                    elif not last_error_note:
                         last_error_note = f"YouTube InnerTube /next HTTP {r_next.status_code}"
                 except Exception as e:
-                    last_error_note = f"YouTube InnerTube /next error: {e}"
+                    if not last_error_note:
+                        last_error_note = f"YouTube InnerTube /next error: {e}"
                     logger.debug(f"InnerTube POST /next bootstrap attempt {n_try + 1} failed: {e}")
                 _close_quietly(session)
                 session, active_profile = _new_session(active_profile + 1)
@@ -857,12 +875,12 @@ async def _collect_via_innertube_curl(
             )
             _run_pagination(newest_token, "Newest", capture_sort=False)
 
-        # Phase 2B: Resume Top continuation if still below cap or below reported comment volume
+        # Phase 2B: Resume Top continuation whenever still below cap or below YouTube's reported volume
         if (
             len(comments) < max_items
             and top_resume_token
             and top_resume_token not in visited_tokens
-            and (est_total == 0 or (len(comments) + len(reply_queue) * 5) < int(est_total * 0.90))
+            and (est_total == 0 or len(comments) < int(est_total * 0.98))
         ):
             logger.info(
                 f"YT innertube resuming Top continuation at {len(comments)}/{max_items} comments (est_total={est_total})"
@@ -897,16 +915,19 @@ async def _collect_via_innertube_curl(
                 ws, w_prof = _get_worker_state()
                 thread_comments: list[RawComment] = []
                 local_seen: set[str] = set()
-                cur_tok: str | None = rtok
+                pending_rtoks: list[str] = [rtok]
                 local_visited: set[str] = set()
+                seen_sub_reps: set[str] = set()
                 sub_pages = 0
                 per_thread_cap = max(500, max_items - len(comments))
                 while (
-                    cur_tok
-                    and cur_tok not in local_visited
+                    pending_rtoks
                     and sub_pages < max_sub_pages
                     and len(thread_comments) < per_thread_cap
                 ):
+                    cur_tok = pending_rtoks.pop(0)
+                    if not cur_tok or cur_tok in local_visited:
+                        continue
                     local_visited.add(cur_tok)
                     sub_pages += 1
                     data, ws, w_prof = _post_with_session(ws, w_prof, cur_tok)
@@ -916,8 +937,8 @@ async def _collect_via_innertube_curl(
                         if ws not in worker_sessions:
                             worker_sessions.append(ws)
                     if data is None:
-                        break
-                    items, _, next_rtok, _ = _extract_innertube_page(
+                        continue
+                    items, _, next_rtok, nested_reps = _extract_innertube_page(
                         data=data,
                         video_id=video_id,
                         source_url=source.url,
@@ -926,10 +947,14 @@ async def _collect_via_innertube_curl(
                         max_items=per_thread_cap,
                         current_count=len(thread_comments),
                         visited_tokens=local_visited,
-                        seen_reply_tokens=set(),
+                        seen_reply_tokens=seen_sub_reps,
                     )
                     thread_comments.extend(items)
-                    cur_tok = next_rtok
+                    if next_rtok and next_rtok not in local_visited:
+                        pending_rtoks.insert(0, next_rtok)
+                    for nr in nested_reps:
+                        if nr and nr not in local_visited:
+                            pending_rtoks.append(nr)
                 return thread_comments
 
             try:
@@ -999,6 +1024,7 @@ async def _collect_via_downloader(
             "Accept-Language": "en-US,en;q=0.9",
         })
         d.session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
+        d.session.cookies.set("SOCS", "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg", domain=".youtube.com")
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         max_c = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
         results: list[dict] = []

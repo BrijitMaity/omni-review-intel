@@ -170,11 +170,54 @@ def _parse_flipkart_reviews_html(html: str, source: DiscoveredSource) -> dict[st
     }
 
 
+def _extract_flipkart_view_urls(html: str, reviews_base_url: str, item_id: str | None) -> list[str]:
+    """Build distinct Flipkart sortOrder and aspect-filter URLs to bypass the ~10-page default cap."""
+    parsed_base = urlparse(reviews_base_url)
+    base_origin = f"{parsed_base.scheme or 'https'}://{parsed_base.netloc or 'www.flipkart.com'}"
+    candidates: list[str] = []
+
+    if html:
+        pattern = (
+            rf"/product-reviews/{re.escape(item_id)}[^\"'\\\s<>]*"
+            if item_id
+            else r"/product-reviews/itm[A-Za-z0-9]+[^\"'\\\s<>]*"
+        )
+        for rel in re.findall(pattern, html, flags=re.IGNORECASE):
+            clean_rel = rel.replace("\\u0026", "&").replace("&amp;", "&")
+            full = clean_rel if clean_rel.startswith("http") else f"{base_origin}{clean_rel}"
+            candidates.append(_to_reviews_page_url(full, page=1))
+
+    # Add core sort modes on base URL in case __INITIAL_STATE__ omitted sort pills
+    parsed_q = parse_qs(parsed_base.query, keep_blank_values=False)
+    base_clean = urlunparse(parsed_base._replace(query="", fragment=""))
+    for sort_order in ("MOST_RECENT", "POSITIVE_FIRST", "NEGATIVE_FIRST", "MOST_HELPFUL"):
+        q_items = {k: v[0] for k, v in parsed_q.items() if v and k not in ("page", "sortOrder", "aid", "certifiedBuyer")}
+        q_items["aid"] = "overall"
+        q_items["certifiedBuyer"] = "false"
+        q_items["sortOrder"] = sort_order
+        candidates.append(f"{base_clean}?{urlencode(q_items)}")
+
+    deduped: list[str] = []
+    seen_sigs: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    base_sig = (parsed_base.path, tuple(sorted((k, v[0]) for k, v in parsed_q.items() if v and k != "page")))
+    seen_sigs.add(base_sig)
+    for u in candidates:
+        pu = urlparse(u)
+        qs = parse_qs(pu.query, keep_blank_values=False)
+        if not qs:
+            continue
+        sig = (pu.path, tuple(sorted((k, v[0]) for k, v in qs.items() if v and k != "page")))
+        if sig not in seen_sigs:
+            seen_sigs.add(sig)
+            deduped.append(u)
+    return deduped
+
+
 def _collect_flipkart_sync(
     source: DiscoveredSource,
     max_items: int | None,
 ) -> dict[str, Any]:
-    """Resolve shortlinks/product links and paginate Flipkart reviews concurrently."""
+    """Resolve shortlinks/product links and paginate Flipkart reviews + sort/aspect facets concurrently."""
     sess = create_chrome_session()
     if sess is None:
         return {"comments": [], "total_reported": 0}
@@ -183,6 +226,7 @@ def _collect_flipkart_sync(
     seen_keys: set[str] = set()
     total_reported = 0
     headers = {"Accept-Language": "en-US,en;q=0.9"}
+    req_timeout = float(max(settings.request_timeout, 15))
 
     def _merge(batch_res: dict[str, Any]) -> int:
         nonlocal total_reported
@@ -205,43 +249,36 @@ def _collect_flipkart_sync(
                 added += 1
         return added
 
-    try:
-        # Resolve dl.flipkart.com / fkrt.it shortlinks or product page redirects first
-        init_resp = sess.get(source.url, headers=headers)
-        final_url = str(getattr(init_resp, "url", source.url))
-        reviews_base_url = _to_reviews_page_url(final_url, page=1)
-
-        if reviews_base_url != final_url:
-            page1_resp = sess.get(reviews_base_url, headers=headers)
+    def _paginate_view(view_url: str, page1_resp_obj: Any = None, max_view_pages: int = 10000) -> str:
+        first_html = ""
+        if page1_resp_obj is not None:
+            r1 = page1_resp_obj
         else:
-            page1_resp = init_resp
-
-        if page1_resp.status_code != 200 or not page1_resp.text:
-            return {"comments": [], "total_reported": 0}
-
-        first_parsed = _parse_flipkart_reviews_html(page1_resp.text, source)
+            r1 = sess.get(_to_reviews_page_url(view_url, page=1), headers=headers)
+        if getattr(r1, "status_code", 0) != 200 or not getattr(r1, "text", ""):
+            return ""
+        first_html = r1.text
+        first_parsed = _parse_flipkart_reviews_html(first_html, source)
         _merge(first_parsed)
         if not first_parsed["comments"]:
-            return {"comments": comments, "total_reported": total_reported}
+            return first_html
 
-        # Calculate max pages dynamically up to user's limit (or full catalog when uncapped)
         per_page = max(len(first_parsed["comments"]), 10)
         if max_items is not None:
-            needed_pages = min((max_items + per_page - 1) // per_page + 2, 10000)
+            remaining = max(0, max_items - len(comments))
+            needed_pages = min((remaining + per_page - 1) // per_page + 2, max_view_pages)
         elif total_reported:
-            needed_pages = min((total_reported + per_page - 1) // per_page + 2, 10000)
+            needed_pages = min((total_reported + per_page - 1) // per_page + 2, max_view_pages)
         else:
-            needed_pages = 10000
+            needed_pages = max_view_pages
 
         if needed_pages > 1 and (max_items is None or len(comments) < max_items):
-            req_timeout = float(max(settings.request_timeout, 15))
-
             def _fetch_page(page_num: int) -> dict[str, Any]:
                 s = create_chrome_session(timeout=req_timeout)
                 if s is None:
                     return {"comments": [], "total_reported": 0}
                 try:
-                    u = _to_reviews_page_url(reviews_base_url, page=page_num)
+                    u = _to_reviews_page_url(view_url, page=page_num)
                     r = s.get(u, headers=headers)
                     if r.status_code == 200 and r.text:
                         return _parse_flipkart_reviews_html(r.text, source)
@@ -261,11 +298,43 @@ def _collect_flipkart_sync(
                         break
                     pages = list(range(start_page, min(start_page + batch_size, needed_pages + 1)))
                     batch_results = list(pool.map(_fetch_page, pages))
+                    batch_parsed_total = sum(len(res["comments"]) for res in batch_results)
                     batch_added = 0
                     for res in batch_results:
                         batch_added += _merge(res)
-                    if batch_added == 0:
+                    if batch_added == 0 or batch_parsed_total == 0:
                         break
+        return first_html
+
+    try:
+        # Resolve dl.flipkart.com / fkrt.it shortlinks or product page redirects first
+        init_resp = sess.get(source.url, headers=headers)
+        final_url = str(getattr(init_resp, "url", source.url))
+        reviews_base_url = _to_reviews_page_url(final_url, page=1)
+
+        if reviews_base_url != final_url:
+            page1_resp = sess.get(reviews_base_url, headers=headers)
+        else:
+            page1_resp = init_resp
+
+        first_html = _paginate_view(reviews_base_url, page1_resp_obj=page1_resp, max_view_pages=10000)
+
+        # Flipkart caps a single review view around page 10-11 (~101 reviews).
+        # If total_reported exceeds collected reviews and limit permits, sweep sortOrder & aspect filters (`aid=`).
+        needs_more = (
+            bool(first_html)
+            and (max_items is None or len(comments) < max_items)
+            and total_reported > len(comments)
+        )
+        if needs_more:
+            item_id = _extract_flipkart_item_id(reviews_base_url)
+            alt_views = _extract_flipkart_view_urls(first_html, reviews_base_url, item_id)
+            for alt_url in alt_views[:20]:
+                if (max_items is not None and len(comments) >= max_items) or (
+                    total_reported and len(comments) >= total_reported
+                ):
+                    break
+                _paginate_view(alt_url, page1_resp_obj=None, max_view_pages=12)
 
     except Exception as e:
         logger.warning(f"Flipkart scrape failed for {source.url}: {e}")
@@ -285,7 +354,7 @@ async def collect_flipkart(source: DiscoveredSource) -> tuple[list[RawComment], 
     """Collect verified Flipkart customer reviews without any API key."""
     item_id = _extract_flipkart_item_id(source.url)
     max_items: int | None = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
-    cache_id = f"flipkart_v2::{item_id or source.url}::{settings.max_comments_per_url}"
+    cache_id = f"flipkart_v3::{item_id or source.url}::{settings.max_comments_per_url}"
 
     cache = get_cache()
     cached = cache.get("s3_flipkart", cache_id)

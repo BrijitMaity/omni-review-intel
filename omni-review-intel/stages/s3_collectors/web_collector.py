@@ -537,7 +537,7 @@ def _heuristic_extract_web_comments(markdown: str, url: str, max_items: int | No
 
 
 async def _llm_extract_comments(markdown: str, url: str, platform: str, max_items: int | None = None) -> list[dict]:
-    """Call LLM when configured, otherwise fall back to full heuristic parser."""
+    """Call LLM across chunks when configured, otherwise fall back to full heuristic parser."""
     if not markdown.strip():
         return []
 
@@ -545,23 +545,39 @@ async def _llm_extract_comments(markdown: str, url: str, platform: str, max_item
         from stages._llm_client import get_llm_client
 
         client = get_llm_client()
-        user_msg = f"Page URL: {url}\nPlatform: {platform}\n\nMarkdown Content:\n{markdown[:14000]}"
-        raw = await client.generate(system=_EXTRACT_SYSTEM, user=user_msg, model_tier="flash")
-        raw_clean = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-        json_match = re.search(r"\[.*\]", raw_clean, re.DOTALL)
-        if json_match:
-            try:
-                parsed = json.loads(json_match.group())
-                if isinstance(parsed, list) and parsed:
-                    return parsed[:max_items] if max_items is not None else parsed
-            except json.JSONDecodeError:
-                pass
-        try:
-            parsed = json.loads(raw_clean)
-            if isinstance(parsed, list) and parsed:
-                return parsed[:max_items] if max_items is not None else parsed
-        except Exception:
-            pass
+        chunk_size = 14000
+        chunks = [markdown[i : i + chunk_size] for i in range(0, min(len(markdown), chunk_size * 4), chunk_size)]
+        collected: list[dict] = []
+        seen_texts: set[str] = set()
+        for chunk in chunks:
+            if max_items is not None and len(collected) >= max_items:
+                break
+            user_msg = f"Page URL: {url}\nPlatform: {platform}\n\nMarkdown Content:\n{chunk}"
+            raw = await client.generate(system=_EXTRACT_SYSTEM, user=user_msg, model_tier="flash")
+            raw_clean = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+            json_match = re.search(r"\[.*\]", raw_clean, re.DOTALL)
+            parsed = None
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    parsed = None
+            if parsed is None:
+                try:
+                    parsed = json.loads(raw_clean)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    txt_key = str(item.get("text") or "").strip().lower()
+                    if not txt_key or txt_key in seen_texts:
+                        continue
+                    seen_texts.add(txt_key)
+                    collected.append(item)
+        if collected:
+            return collected[:max_items] if max_items is not None else collected
     except Exception as e:
         logger.debug(f"LLM extraction not available for {url} ({e}) — using built-in smart web text parser")
 

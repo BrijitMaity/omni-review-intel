@@ -748,3 +748,189 @@ def test_stage2_youtube_review_fallback_discovers_relevant_videos():
     assert res[0]["url"] == "https://www.youtube.com/watch?v=6CsJZxfZsL0"
     assert "Sony WH-1000XM5 Review" in res[0]["title"]
     assert "Marques Brownlee" in res[0]["snippet"]
+
+
+def test_flipkart_sweeps_sort_and_aspect_views_past_10_page_cap(tmp_path):
+    """When total_reported > page-10 limit, Flipkart collector sweeps sortOrder & aspect aid= views."""
+    from types import SimpleNamespace
+    from core.cache import Cache
+    from core.schemas import DiscoveredSource
+    from stages.s3_collectors.flipkart_collector import collect_flipkart
+
+    src = DiscoveredSource(
+        url="https://www.flipkart.com/test-phone/p/itmTEST123",
+        platform="Flipkart",
+        title="Test Phone",
+        is_target=True,
+    )
+
+    def _state_html(reviews_list, total_cnt=30):
+        payload = {
+            "pageDataV4": {
+                "page": {
+                    "data": {
+                        "1": [
+                            {
+                                "widget": {
+                                    "data": {
+                                        "totalReviewCount": total_cnt,
+                                        "renderableComponents": [
+                                            {"value": r} for r in reviews_list
+                                        ],
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            "extraLinks": [
+                "/product-reviews/itmTEST123?aid=aspect-cam&sortOrder=MOST_HELPFUL&certifiedBuyer=false",
+            ],
+        }
+        return f"<script>window.__INITIAL_STATE__ = {json.dumps(payload)};</script>"
+
+    class _FakeSess:
+        def get(self, url, **kwargs):
+            if "/p/itmTEST123" in url:
+                return SimpleNamespace(status_code=200, url=url, text="<html></html>")
+            if "sortOrder=MOST_RECENT" in url and "page=" not in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    url=url,
+                    text=_state_html([{"id": "fk_r1", "author": "U2", "text": "Recent review text", "rating": 5}]),
+                )
+            if "aid=aspect-cam" in url and "page=" not in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    url=url,
+                    text=_state_html([{"id": "fk_a1", "author": "U3", "text": "Great camera aspect review", "rating": 4}]),
+                )
+            if "page=" not in url and "sortOrder=" not in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    url=url,
+                    text=_state_html([{"id": "fk_p1", "author": "U1", "text": "Default helpful review", "rating": 5}]),
+                )
+            return SimpleNamespace(status_code=200, url=url, text="<html></html>")
+
+        def close(self):
+            pass
+
+    fresh_cache = Cache(db_path=str(tmp_path / "fk_multi.db"))
+    with (
+        patch("stages.s3_collectors.flipkart_collector.get_cache", return_value=fresh_cache),
+        patch("stages.s3_collectors.flipkart_collector.create_chrome_session", return_value=_FakeSess()),
+        patch("stages.s3_collectors.flipkart_collector.settings.max_comments_per_url", 0),
+    ):
+        cmts, updated = asyncio.run(collect_flipkart(src))
+
+    texts = [c.original_text for c in cmts]
+    assert len(cmts) == 3
+    assert "Default helpful review" in texts
+    assert "Recent review text" in texts
+    assert "Great camera aspect review" in texts
+    assert updated.comments_collected == 3
+
+
+def test_reddit_public_json_expands_morechildren(tmp_path):
+    """Verify public Reddit collector expands hidden kind='more' batches via /api/morechildren.json."""
+    from types import SimpleNamespace
+    from core.cache import Cache
+    from core.schemas import DiscoveredSource
+    from stages.s3_collectors.reddit_collector import collect_reddit
+
+    src = DiscoveredSource(
+        url="https://www.reddit.com/r/headphones/comments/w65b33/sony_review/",
+        platform="Reddit",
+        is_target=True,
+    )
+    main_json = [
+        {"data": {"children": [{"data": {"name": "t3_w65b33"}}]}},
+        {
+            "data": {
+                "children": [
+                    {"kind": "t1", "data": {"id": "c1", "author": "u1", "body": "Initial embedded review", "created_utc": 1700000000}},
+                    {"kind": "more", "data": {"children": ["c2", "c3"]}},
+                ]
+            }
+        },
+    ]
+    more_json = {
+        "json": {
+            "data": {
+                "things": [
+                    {"kind": "t1", "data": {"id": "c2", "author": "u2", "body": "Expanded hidden reply 1", "created_utc": 1700000100}},
+                    {"kind": "t1", "data": {"id": "c3", "author": "u3", "body": "Expanded hidden reply 2", "created_utc": 1700000200}},
+                ]
+            }
+        }
+    }
+
+    class _FakeSess:
+        def get(self, url, **kwargs):
+            if "morechildren.json" in url:
+                assert "link_id=t3_w65b33" in url
+                assert "c2,c3" in url
+                return SimpleNamespace(status_code=200, text="ok", json=lambda: more_json)
+            return SimpleNamespace(status_code=200, text="ok", json=lambda: main_json)
+
+        def close(self):
+            pass
+
+    fresh_cache = Cache(db_path=str(tmp_path / "red_more.db"))
+    async def _run():
+        with (
+            patch("stages.s3_collectors.reddit_collector.get_cache", return_value=fresh_cache),
+            patch("stages.s3_collectors.reddit_collector.settings.reddit_client_id", ""),
+            patch("stages.s3_collectors.reddit_collector.settings.reddit_client_secret", ""),
+            patch("stages.s3_collectors.reddit_collector.settings.max_comments_per_url", 0),
+            patch("stages.s3_collectors._http_utils.create_chrome_session", return_value=_FakeSess()),
+        ):
+            return await collect_reddit(src)
+
+    cmts, updated = asyncio.run(_run())
+    assert len(cmts) == 3
+    assert any("Expanded hidden reply 2" in c.original_text for c in cmts)
+    assert updated.collector_used == "reddit_public_json"
+
+
+def test_youtube_innertube_extracts_buttonviewmodel_continuation():
+    """Verify _extract_innertube_page extracts modern buttonViewModel continuation tokens."""
+    from stages.s3_collectors.youtube_collector import _extract_innertube_page
+
+    page = {
+        "onResponseReceivedEndpoints": [
+            {
+                "appendContinuationItemsAction": {
+                    "continuationItems": [
+                        {
+                            "continuationItemRenderer": {
+                                "button": {
+                                    "buttonViewModel": {
+                                        "onTap": {
+                                            "innertubeCommand": {
+                                                "continuationCommand": {"token": "NEXT_TOKEN_VM"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    _, _, next_tok, _ = _extract_innertube_page(
+        data=page,
+        video_id="vid123",
+        source_url="https://www.youtube.com/watch?v=vid123",
+        is_target=True,
+        seen_ids=set(),
+        max_items=100,
+        current_count=0,
+        visited_tokens=set(),
+        seen_reply_tokens=set(),
+    )
+    assert next_tok == "NEXT_TOKEN_VM"
