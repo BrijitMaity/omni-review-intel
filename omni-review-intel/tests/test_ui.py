@@ -123,6 +123,9 @@ def test_ui_theme_tokens_and_css_contrast():
     assert "color-scheme: dark;" in dark_css
     assert "--neu-text:" in light_css
     assert "--neu_text" not in light_css
+    for selector in ('[data-testid="stToolbarActions"]', '[data-testid="stMainMenu"]', "#MainMenu"):
+        assert selector in light_css
+        assert selector in dark_css
 
     layout = plotly_base_layout(dark_pal, height=350)
     assert layout["template"] == "plotly_dark"

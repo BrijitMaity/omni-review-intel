@@ -174,9 +174,18 @@ html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], .main {{
     color: var(--text-primary) !important;
     font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }}
-[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"] {{
+[data-testid="stHeader"], [data-testid="stToolbar"] {{
     background-color: var(--bg-app) !important;
     color: var(--text-primary) !important;
+}}
+[data-testid="stToolbarActions"],
+[data-testid="stAppDeployButton"],
+[data-testid="stMainMenu"],
+#MainMenu,
+[data-testid="stDecoration"],
+footer {{
+    display: none !important;
+    visibility: hidden !important;
 }}
 [data-testid="stAppViewContainer"] h1,
 [data-testid="stAppViewContainer"] h2,
