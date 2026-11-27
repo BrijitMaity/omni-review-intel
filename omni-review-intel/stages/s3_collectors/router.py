@@ -65,7 +65,12 @@ async def _collect_one(
                 coro = collect_apify(source)
             else:
                 coro = collect_web(source)
-            comments, source = await asyncio.wait_for(coro, timeout=180.0)
+            # Never artificially kill an uncapped primary target scrape at 180s
+            timeout_secs = None if (source.is_target and int(settings.max_comments_per_url or 0) <= 0) else 180.0
+            if timeout_secs is None:
+                comments, source = await coro
+            else:
+                comments, source = await asyncio.wait_for(coro, timeout=timeout_secs)
         except asyncio.TimeoutError:
             logger.warning(f"Collector timed out after 180s for {source.url}")
             source.scrape_status = "partial"
@@ -104,10 +109,11 @@ async def collect_all(
         comments, updated = await _collect_one(src, sem)
         completed_count += 1
         if progress_cb:
+            count_disp = max(len(comments), int(updated.comments_collected or 0))
             await progress_cb(
                 "Stage 3",
                 f"Scraped {completed_count}/{total}: [{updated.platform}] {updated.url[:60]} "
-                f"→ {len(comments)} comments ({updated.scrape_status})",
+                f"→ {count_disp:,} comments ({updated.scrape_status})",
             )
         return comments, updated
 

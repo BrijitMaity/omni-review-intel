@@ -521,6 +521,162 @@ async def reduce_synthesize(
     return executive, valid
 
 
+async def map_reduce_streamed(
+    run_store,
+    topic: TopicProfile,
+    input_url: str,
+    progress_cb=None,
+) -> tuple[ExecutiveReview, list[AnalyzedComment], dict]:
+    """Chunked, constant-RAM Map-Reduce Stage 4 over a disk-backed RunStore."""
+    from core.run_store import CompactIdSet
+
+    total_raw = run_store.raw_count()
+    if total_raw == 0:
+        return _stub_review(topic, input_url), [], {}
+
+    try:
+        from stages._llm_client import get_llm_client
+        llm = get_llm_client()
+    except Exception as e:
+        logger.warning(f"No LLM client configured ({e}) — using fast heuristic analysis")
+        llm = None
+
+    prompt_path = Path("prompts/batch_comment_eval.txt")
+    seen_ids = CompactIdSet()
+    seen_author_text = CompactIdSet()
+    sem = asyncio.Semaphore(4)
+
+    processed_raw = 0
+    for chunk in run_store.iter_raw_chunks(chunk_size=3000):
+        clean_chunk: list[RawComment] = []
+        for c in chunk:
+            text = " ".join(c.original_text.split())
+            if not text:
+                continue
+            if c.comment_id and c.comment_id in seen_ids:
+                continue
+            at_key = f"{c.author.lower().strip()}\0{text.lower()}"
+            if at_key in seen_author_text:
+                continue
+            if c.comment_id:
+                seen_ids.add(c.comment_id)
+            seen_author_text.add(at_key)
+            clean_chunk.append(
+                c.model_copy(update={"original_text": text})
+                if text != c.original_text
+                else c
+            )
+
+        if clean_chunk:
+            batches = list(_chunk(clean_chunk, settings.llm_batch_size))
+
+            async def _run_b(b: list[RawComment]) -> list[AnalyzedComment]:
+                async with sem:
+                    return await _analyze_batch(b, topic.canonical_name, prompt_path, llm)
+
+            res_lists = await asyncio.gather(*[_run_b(b) for b in batches], return_exceptions=True)
+            analyzed_chunk: list[AnalyzedComment] = []
+            for r in res_lists:
+                if isinstance(r, BaseException):
+                    logger.error(f"Streamed batch task failed: {r}")
+                else:
+                    analyzed_chunk.extend(r)
+            if analyzed_chunk:
+                run_store.add_analyzed_batch(analyzed_chunk)
+
+        processed_raw += len(chunk)
+        if progress_cb:
+            await progress_cb(
+                "Stage 4 Map",
+                f"Analyzed {processed_raw:,}/{total_raw:,} comments",
+            )
+        await asyncio.sleep(0)
+
+    stats = run_store.compute_stats_sql()
+    if not stats or stats.get("total", 0) == 0:
+        return _stub_review(topic, input_url), [], stats or {}
+
+    sample, ui_preview = run_store.sample_analyzed(limit_per_sentiment=10, ui_preview_limit=15000)
+
+    aspect_summaries = [
+        AspectSummary(
+            aspect_name=asp,
+            mention_count=data["mention_count"],
+            positive_pct=data["positive_pct"],
+            neutral_pct=data["neutral_pct"],
+            negative_pct=data["negative_pct"],
+        )
+        for asp, data in sorted(
+            stats["aspect_stats"].items(),
+            key=lambda x: x[1]["mention_count"],
+            reverse=True,
+        )
+    ]
+
+    system_path = Path("prompts/executive_review.txt")
+    system = (
+        system_path.read_text(encoding="utf-8")
+        if system_path.exists()
+        else (
+            "You are a Senior Consumer Research Analyst. "
+            "Return ONLY valid JSON matching ExecutiveReview schema."
+        )
+    ).replace("{topic_name}", topic.canonical_name)
+
+    prompt_stats = {
+        k: stats[k]
+        for k in (
+            "total", "positive", "neutral", "negative",
+            "positive_pct", "neutral_pct", "negative_pct",
+            "platform_stats", "aspect_stats",
+        )
+        if k in stats
+    }
+    user_msg = (
+        f'Topic: "{topic.canonical_name}"\n'
+        f"Original URL: {input_url}\n\n"
+        f"=== Aggregated Statistics ===\n{json.dumps(prompt_stats, indent=2)}\n\n"
+        f"=== Representative Comments (sample) ===\n"
+        f"{json.dumps(sample, indent=2, ensure_ascii=False)}\n\n"
+        "Return ExecutiveReview JSON with ALL required fields: "
+        "topic_name, original_url, overall_sentiment, ai_score_out_of_10, "
+        "executive_summary, top_pros, top_cons, common_complaints, "
+        "platform_comparison_notes, buying_or_action_verdict, aspect_summaries."
+    )
+
+    if progress_cb:
+        await progress_cb("Stage 4 Reduce", "Generating Executive Review via LLM…")
+
+    executive = None
+    try:
+        from stages._llm_client import get_llm_client
+        llm_red = get_llm_client()
+        executive = await llm_red.structured_generate(
+            system=system,
+            user=user_msg,
+            schema=ExecutiveReview,
+            model_tier="pro",
+        )
+        llm_takeaways = {
+            a.aspect_name.lower().strip(): a.key_takeaway
+            for a in executive.aspect_summaries
+            if a.key_takeaway
+        }
+        merged_aspects = [
+            a.model_copy(
+                update={"key_takeaway": llm_takeaways.get(a.aspect_name.lower().strip(), a.key_takeaway)}
+            )
+            for a in aspect_summaries
+        ]
+        executive = executive.model_copy(update={"aspect_summaries": merged_aspects})
+    except Exception as e:
+        logger.warning(f"Executive review LLM unavailable or failed ({e}) — using data-backed synthesis")
+        executive = _stub_review(topic, input_url, stats=stats, comments=ui_preview)
+        executive = executive.model_copy(update={"aspect_summaries": aspect_summaries})
+
+    return executive, ui_preview, stats
+
+
 def _stub_review(
     topic: TopicProfile,
     input_url: str,

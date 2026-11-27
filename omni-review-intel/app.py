@@ -439,7 +439,12 @@ if submitted:
         progress_bar = st.progress(0.0, text="Initializing pipeline…")
         log_placeholder = st.empty()
 
+        import gc
         import queue as queue_mod
+        # Release previous run state before building a new large report
+        st.session_state.analysis_state = None
+        st.session_state.multi_analysis_states = []
+        gc.collect()
         collected_states = []
 
         total_urls = len(urls_to_process)
@@ -504,6 +509,15 @@ if submitted:
                 m_stage = re.search(r"(\d+)", latest_stage)
                 stage_num = m_stage.group(1) if m_stage else ""
                 pct = stage_progress.get(stage_num, 0.0)
+                if stage_num == "3":
+                    m_ratio = re.search(r"([\d,]+)\s*/\s*~?([\d,]+)", latest_msg)
+                    if m_ratio:
+                        try:
+                            cur_n = int(m_ratio.group(1).replace(",", ""))
+                            tot_n = max(1, int(m_ratio.group(2).replace(",", "")))
+                            pct = 0.40 + 0.28 * min(1.0, cur_n / tot_n)
+                        except ValueError:
+                            pass
                 if latest_msg.startswith(("Topic identified", "Discovered", "Collected", "Analysis complete", "Report ready")):
                     pct = stage_progress.get(str(int(stage_num) + 1) if stage_num.isdigit() else stage_num, pct)
                 overall_pct = ((u_idx - 1) + min(pct + 0.05, 0.98)) / total_urls
@@ -569,11 +583,16 @@ if st.session_state.analysis_state is not None:
     # ── Product Identity Banner ───────────────────────────────────────────────
     is_product = bool(state.topic and state.topic.input_type == "product")
     rating_unit = "global customer ratings" if is_product else "analyzed public comments"
-    tgt_count = sum(1 for c in state.analyzed_comments if c.is_target)
-    web_count = max(0, len(state.analyzed_comments) - tgt_count)
+    exact_stats = getattr(state, "analytics_stats", None) or {}
+    if exact_stats.get("total"):
+        tgt_count = int(exact_stats.get("target_count", 0))
+        web_count = int(exact_stats.get("discovered_count", 0))
+    else:
+        tgt_count = sum(1 for c in state.analyzed_comments if c.is_target)
+        web_count = max(0, len(state.analyzed_comments) - tgt_count)
     split_note = (
         f" &nbsp;·&nbsp; <span class='meta-subtext'>Target URL: <b>{tgt_count:,}</b> | Web Discovery: <b>{web_count:,}</b></span>"
-        if state.analyzed_comments
+        if (state.analyzed_comments or exact_stats.get("total"))
         else ""
     )
 
@@ -639,10 +658,11 @@ if st.session_state.analysis_state is not None:
                         "2. Copy the **`sessionid`** cookie value.\n"
                         "3. Open **Sidebar (left) → ⚙️ Optional Settings & AI Key → Instagram Session Cookie**, paste it (kept isolated in your session only), and click **🔍 Analyze** again."
                     )
+    display_comment_count = state.total_comments_valid or len(state.analyzed_comments)
     tab_overview, tab_sources, tab_comments, tab_analytics = st.tabs([
         "📊 Customer Review Overview",
         f"🌐 Discovered Sources ({len(state.sources)})",
-        f"💬 Customer Reviews ({len(state.analyzed_comments):,})",
+        f"💬 Customer Reviews ({display_comment_count:,})",
         "📈 Analytics & Charts",
     ])
 
@@ -841,7 +861,7 @@ if st.session_state.analysis_state is not None:
         st.dataframe(styled_sources, use_container_width=True, hide_index=True)
 
     with tab_comments:
-        st.markdown(f"### Master Customer Reviews ({len(state.analyzed_comments):,})")
+        st.markdown(f"### Master Customer Reviews ({display_comment_count:,})")
         import pandas as pd
         c_filter1, c_filter2 = st.columns([1, 2])
         with c_filter1:
@@ -858,10 +878,21 @@ if st.session_state.analysis_state is not None:
 
         _MAX_UI_TABLE_ROWS = 25000
         display_rows = filtered[:_MAX_UI_TABLE_ROWS]
-        if len(filtered) > _MAX_UI_TABLE_ROWS:
+        total_valid_all = state.total_comments_valid or len(state.analyzed_comments)
+        if total_valid_all > len(state.analyzed_comments) and sent_filter == "All" and not search_query.strip():
+            st.caption(
+                f"Showing {len(display_rows):,} balanced preview rows in browser out of "
+                f"{total_valid_all:,} valid analyzed comments (ALL {total_valid_all:,} exported in Excel report)"
+            )
+        elif len(filtered) > _MAX_UI_TABLE_ROWS:
             st.caption(
                 f"Showing first {_MAX_UI_TABLE_ROWS:,} of {len(filtered):,} matching comments in browser table "
                 f"(all {len(filtered):,} comments are exported in the Excel report)"
+            )
+        elif total_valid_all > len(state.analyzed_comments):
+            st.caption(
+                f"Showing {len(filtered):,} matching rows from the {len(state.analyzed_comments):,}-row browser preview "
+                f"(download Excel for all {total_valid_all:,} comments)"
             )
         else:
             st.caption(f"Showing all {len(filtered):,} matching comments (fully exported in Excel as well)")
@@ -940,13 +971,23 @@ if st.session_state.analysis_state is not None:
 
             with a_col2:
                 st.markdown("**Platform Volume & Sentiment Breakdown**")
-                plat_counts: dict[str, dict[str, int]] = defaultdict(
-                    lambda: {"Positive": 0, "Neutral": 0, "Negative": 0}
-                )
-                for c in state.analyzed_comments:
-                    p_name = str(c.platform)
-                    s_name = c.sentiment if c.sentiment in ("Positive", "Neutral", "Negative") else "Neutral"
-                    plat_counts[p_name][s_name] += 1
+                if exact_stats.get("platform_stats"):
+                    plat_counts = {
+                        k: {
+                            "Positive": int(v["positive"]),
+                            "Neutral": int(v["neutral"]),
+                            "Negative": int(v["negative"]),
+                        }
+                        for k, v in exact_stats["platform_stats"].items()
+                    }
+                else:
+                    plat_counts = defaultdict(
+                        lambda: {"Positive": 0, "Neutral": 0, "Negative": 0}
+                    )
+                    for c in state.analyzed_comments:
+                        p_name = str(c.platform)
+                        s_name = c.sentiment if c.sentiment in ("Positive", "Neutral", "Negative") else "Neutral"
+                        plat_counts[p_name][s_name] += 1
 
                 if plat_counts:
                     plats = sorted(
@@ -1055,19 +1096,24 @@ if st.session_state.analysis_state is not None:
                     st.plotly_chart(fig2, use_container_width=True)
 
             with b_col2:
-                rated = [c.rating for c in state.analyzed_comments if c.rating is not None]
+                exact_ratings = exact_stats.get("rating_buckets") or {}
+                has_exact_ratings = any(int(v) > 0 for v in exact_ratings.values()) if exact_ratings else False
+                rated = [] if exact_stats else [c.rating for c in state.analyzed_comments if c.rating is not None]
                 top_src = sorted(
                     [s for s in state.sources if s.comments_collected > 0],
                     key=lambda s: s.comments_collected,
                     reverse=True,
                 )[:8]
 
-                if rated:
+                if has_exact_ratings or rated:
                     st.markdown("**Star Rating Distribution (1★ – 5★)**")
-                    star_buckets = {i: 0 for i in range(1, 6)}
-                    for r in rated:
-                        bucket = max(1, min(5, round(float(r))))
-                        star_buckets[bucket] += 1
+                    if has_exact_ratings:
+                        star_buckets = {i: int(exact_ratings.get(i, exact_ratings.get(str(i), 0))) for i in range(1, 6)}
+                    else:
+                        star_buckets = {i: 0 for i in range(1, 6)}
+                        for r in rated:
+                            bucket = max(1, min(5, round(float(r))))
+                            star_buckets[bucket] += 1
                     fig_stars = go.Figure(
                         data=[
                             go.Bar(
@@ -1108,18 +1154,21 @@ if st.session_state.analysis_state is not None:
                     st.plotly_chart(fig_src, use_container_width=True)
                 else:
                     st.markdown("**Sentiment Confidence Distribution**")
-                    conf_buckets = {
-                        "High (≥85%)": {"Positive": 0, "Neutral": 0, "Negative": 0},
-                        "Medium (65–84%)": {"Positive": 0, "Neutral": 0, "Negative": 0},
-                        "Moderate (<65%)": {"Positive": 0, "Neutral": 0, "Negative": 0},
-                    }
-                    for c in state.analyzed_comments:
-                        tier = (
-                            "High (≥85%)" if c.confidence_score >= 0.85
-                            else ("Medium (65–84%)" if c.confidence_score >= 0.65 else "Moderate (<65%)")
-                        )
-                        s_name = c.sentiment if c.sentiment in ("Positive", "Neutral", "Negative") else "Neutral"
-                        conf_buckets[tier][s_name] += 1
+                    if exact_stats.get("conf_buckets"):
+                        conf_buckets = exact_stats["conf_buckets"]
+                    else:
+                        conf_buckets = {
+                            "High (≥85%)": {"Positive": 0, "Neutral": 0, "Negative": 0},
+                            "Medium (65–84%)": {"Positive": 0, "Neutral": 0, "Negative": 0},
+                            "Moderate (<65%)": {"Positive": 0, "Neutral": 0, "Negative": 0},
+                        }
+                        for c in state.analyzed_comments:
+                            tier = (
+                                "High (≥85%)" if c.confidence_score >= 0.85
+                                else ("Medium (65–84%)" if c.confidence_score >= 0.65 else "Moderate (<65%)")
+                            )
+                            s_name = c.sentiment if c.sentiment in ("Positive", "Neutral", "Negative") else "Neutral"
+                            conf_buckets[tier][s_name] += 1
                     tiers = list(conf_buckets.keys())
                     fig_conf = go.Figure(
                         data=[
@@ -1154,14 +1203,15 @@ if st.session_state.analysis_state is not None:
             if xp.exists():
                 sz = xp.stat().st_size // 1024
                 topic_title = s.topic.canonical_name if s.topic else f"Target {i}"
-                st.download_button(
-                    label=f"⬇️ Download Excel: Target {i} — {topic_title} ({sz} KB)",
-                    data=xp.read_bytes(),
-                    file_name=xp.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_target_{i}",
-                    use_container_width=True,
-                )
+                with xp.open("rb") as _xf:
+                    st.download_button(
+                        label=f"⬇️ Download Excel: Target {i} — {topic_title} ({sz} KB)",
+                        data=_xf,
+                        file_name=xp.name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_target_{i}",
+                        use_container_width=True,
+                    )
         st.markdown("---")
 
     xlsx_path = Path(state.output_xlsx_path)
@@ -1170,13 +1220,14 @@ if st.session_state.analysis_state is not None:
         file_size_kb = xlsx_path.stat().st_size // 1024
         dl_col1, dl_col2, dl_col3 = st.columns([1, 2, 1])
         with dl_col2:
-            st.download_button(
-                label=f"⬇️ Download Full Excel Report ({file_size_kb} KB)",
-                data=xlsx_path.read_bytes(),
-                file_name=xlsx_path.name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            with xlsx_path.open("rb") as _xf:
+                st.download_button(
+                    label=f"⬇️ Download Full Excel Report ({file_size_kb} KB)",
+                    data=_xf,
+                    file_name=xlsx_path.name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
             st.markdown(
                 f"<p class='meta-subtext' style='text-align:center;font-size:0.85rem;margin-top:6px;'>"
                 f"📄 {xlsx_path.name} &bull; Includes 9 sheets: All Reviews, Target Reviews, Good, Bad, Neutral, Discovered Web Reviews, Executive Review, Platform &amp; Aspect Summary, Sources</p>",

@@ -267,3 +267,4 @@ class PipelineState(BaseModel):
     positive_pct: float = Field(default=0.0)
     neutral_pct: float = Field(default=0.0)
     negative_pct: float = Field(default=0.0)
+    analytics_stats: dict = Field(default_factory=dict)

@@ -177,7 +177,7 @@ def test_effective_max_comments_and_router_cancel_timeout(monkeypatch):
         assert config.effective_max_comments(is_target=False) == 1500
 
         monkeypatch.setattr(config, "get_container_memory_limit_mb", lambda: 1024.0)
-        assert config.effective_max_comments(is_target=True) == 15000
+        assert config.effective_max_comments(is_target=True) == 0
         assert config.effective_max_comments(is_target=False) == 1000
     finally:
         config.settings.max_comments_per_url = orig

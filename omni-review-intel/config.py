@@ -19,6 +19,12 @@ _scoped_overrides: ContextVar[Optional[dict[str, Any]]] = ContextVar(
 _cancel_event_var: ContextVar[Optional[threading.Event]] = ContextVar(
     "omni_run_cancel_event", default=None
 )
+_run_store_var: ContextVar[Optional[Any]] = ContextVar(
+    "omni_run_store", default=None
+)
+_progress_cb_var: ContextVar[Optional[Any]] = ContextVar(
+    "omni_progress_cb", default=None
+)
 
 _BYPASS_SCOPED_ATTRS = frozenset({
     "model_fields",
@@ -191,6 +197,36 @@ def is_run_cancelled() -> bool:
     return bool(ev is not None and ev.is_set())
 
 
+@contextmanager
+def scoped_run_store(store: Any) -> Iterator[None]:
+    """Bind a per-run disk-backed RunStore to the current thread/async context."""
+    token = _run_store_var.set(store)
+    try:
+        yield
+    finally:
+        _run_store_var.reset(token)
+
+
+def get_run_store() -> Optional[Any]:
+    """Return the active per-run RunStore if bound."""
+    return _run_store_var.get()
+
+
+@contextmanager
+def scoped_progress_cb(cb: Any) -> Iterator[None]:
+    """Bind an async progress callback cleanly to the current thread/async context."""
+    token = _progress_cb_var.set(cb)
+    try:
+        yield
+    finally:
+        _progress_cb_var.reset(token)
+
+
+def get_progress_cb() -> Optional[Any]:
+    """Return the active async progress callback if bound."""
+    return _progress_cb_var.get()
+
+
 def get_container_memory_limit_mb() -> Optional[float]:
     """Return Linux cgroup memory limit in MiB when running in a memory-bounded container."""
     for cg_path in (
@@ -216,14 +252,12 @@ def get_container_memory_limit_mb() -> Optional[float]:
 
 
 def effective_max_comments(is_target: bool = True) -> int:
-    """Return per-source comment limit respecting uncapped mode and container RAM ceilings."""
+    """Return per-source comment limit; target URLs stream uncapped when requested <= 0."""
     requested = int(settings.max_comments_per_url or 0)
+    if requested > 0:
+        return requested
+    if is_target:
+        # Uncapped mode streams to SQLite RunStore + write-only Excel so 300k+ fit in 1 GB RAM
+        return 0
     limit_mb = get_container_memory_limit_mb()
-    if limit_mb is not None and limit_mb <= 2048.0:
-        safe_target = 15_000 if limit_mb <= 1300.0 else 25_000
-        safe_secondary = 1_000
-        cap = safe_target if is_target else safe_secondary
-        return cap if requested <= 0 else min(requested, cap)
-    if requested <= 0:
-        return 0 if is_target else 1_500
-    return requested
+    return 1_000 if (limit_mb is not None and limit_mb <= 2048.0) else 1_500
