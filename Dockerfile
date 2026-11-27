@@ -12,6 +12,8 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+RUN mkdir -p /app/omni-review-intel/outputs && chmod -R a+rwX /app/omni-review-intel
+
 EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
