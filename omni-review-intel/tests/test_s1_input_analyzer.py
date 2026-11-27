@@ -140,3 +140,12 @@ def test_social_url_slug_fallbacks_avoid_numeric_ids():
 
     assert _extract_title_from_text_or_url("URL: https://www.tiktok.com/@bellapoarch/video/6862153058223197445", "https://www.tiktok.com/@bellapoarch/video/6862153058223197445") == "TikTok Video by @bellapoarch"
     assert _extract_title_from_text_or_url("URL: https://x.com/jack/status/20", "https://x.com/jack/status/20") == "X Post by @jack"
+
+
+def test_instagram_generic_title_rejected_and_not_cached():
+    from stages.s1_input_analyzer import _extract_ig_headline, _is_generic_fallback_title
+
+    headline, _ = _extract_ig_headline("Instagram", "")
+    assert headline == ""
+    assert _is_generic_fallback_title("Instagram Post (DgMZ0QMTquh)", "https://www.instagram.com/p/DgMZ0QMTquh/") is True
+    assert _is_generic_fallback_title("Cognizant Service Desk Hiring", "https://www.instagram.com/p/DgMZ0QMTquh/") is False

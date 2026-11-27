@@ -603,6 +603,15 @@ if st.session_state.analysis_state is not None:
     for _tsrc in state.sources:
         if _tsrc.is_target and _tsrc.scrape_status in ("partial", "failed") and _tsrc.error_message:
             st.warning(f"**Target {_tsrc.platform} Notice:** {_tsrc.error_message}")
+            if _tsrc.platform == "Instagram":
+                with st.expander("🔓 How to collect ALL comments from this Instagram post (15-second setup)"):
+                    st.markdown(
+                        "Instagram blocks anonymous scraping after ~8–12 preview comments (`rate limit` / login gate). "
+                        "To fetch **all thousands of comments & replies**:\n"
+                        "1. Open Instagram logged-in inside your browser and press **F12 → Application → Cookies → `https://www.instagram.com`**.\n"
+                        "2. Copy the **`sessionid`** cookie value.\n"
+                        "3. Open **Sidebar (left) → ⚙️ Optional Settings & AI Key → Instagram Session Cookie**, paste it (kept isolated in your session only), and click **🔍 Analyze** again."
+                    )
     tab_overview, tab_sources, tab_comments, tab_analytics = st.tabs([
         "📊 Customer Review Overview",
         f"🌐 Discovered Sources ({len(state.sources)})",

@@ -200,7 +200,9 @@ def _extract_ig_headline(raw_title: str, raw_desc: str, uploader: str = "") -> t
         if clean_caption:
             desc = clean_caption
 
-    is_generic = not title or title.lower().startswith("video by ") or title.lower() in ("instagram", "instagram post")
+    is_generic = not title or title.lower().startswith("video by ") or title.lower() in ("instagram", "instagram post", "instagram video")
+    if is_generic and not desc:
+        return "", author
     candidate = desc if is_generic and desc else title
     candidate = re.sub(r"\s+", " ", candidate).strip().strip('"').strip("'")
     if len(candidate) > 95:
@@ -268,6 +270,18 @@ async def _fetch_ig_metadata_http(url: str) -> dict | None:
                 title_tag_m = re.search(r"<title>(.*?)</title>", html_text, re.DOTALL | re.IGNORECASE)
                 title_tag = title_tag_m.group(1) if title_tag_m else ""
                 headline, author = _extract_ig_headline(og_title or title_tag, desc)
+                if not headline:
+                    # Try embedded JSON caption/owner text when og:title was generic 'Instagram'
+                    m_cap = re.search(r'"caption"\s*:\s*\{[^{}]*"text"\s*:\s*"((?:\\.|[^"\\])+)"', html_text)
+                    if m_cap:
+                        try:
+                            cap_decoded = json.loads(f'"{m_cap.group(1)}"')
+                            m_user = re.search(r'"username"\s*:\s*"([A-Za-z0-9_.]+)"', html_text)
+                            author = author or (m_user.group(1) if m_user else "")
+                            headline, author = _extract_ig_headline("", cap_decoded, uploader=author)
+                            desc = desc or cap_decoded
+                        except Exception:
+                            pass
                 if headline or desc:
                     return {
                         "title": headline or f"Instagram Post ({shortcode})",
@@ -277,14 +291,19 @@ async def _fetch_ig_metadata_http(url: str) -> dict | None:
                         "uploader": author,
                     }
 
-            # Fallback to /embed/captioned/ when main post page redirects to login wall
+            # Fallback to /embed/captioned/ when main post page redirects to login wall or omits meta tags
             emb_resp = sess.get(f"https://www.instagram.com/p/{shortcode}/embed/captioned/")
             if emb_resp.status_code == 200 and emb_resp.text:
                 soup = BeautifulSoup(emb_resp.text, "html.parser")
                 cap_el = soup.select_one(".Caption")
-                usr_el = soup.select_one(".UsernameText, .HeaderText a")
-                cap_txt = cap_el.get_text(" ", strip=True) if cap_el else ""
+                usr_el = soup.select_one(".UsernameText, .HeaderText a, .CaptionUsername")
                 usr_txt = usr_el.get_text(" ", strip=True) if usr_el else ""
+                if cap_el:
+                    for u_rm in cap_el.select(".CaptionUsername"):
+                        if not usr_txt:
+                            usr_txt = u_rm.get_text(" ", strip=True)
+                        u_rm.decompose()
+                cap_txt = cap_el.get_text(" ", strip=True) if cap_el else ""
                 if cap_txt:
                     headline, author = _extract_ig_headline("", cap_txt, uploader=usr_txt)
                     return {
@@ -791,6 +810,35 @@ async def _llm_extract_topic(
 # ── Main Stage 1 Entry Point ──────────────────────────────────────────────────
 
 
+def _is_generic_fallback_title(name: str, url: str = "") -> bool:
+    """Return True if topic title is merely an ID/placeholder that should not poison cache."""
+    cname = (name or "").strip()
+    low = cname.lower()
+    if not cname or low in (
+        "instagram",
+        "instagram post",
+        "facebook",
+        "tiktok",
+        "tiktok - make your day",
+        "reddit - dive into anything",
+        "amazon.com",
+        "amazon.in",
+        "review item",
+        "product review target",
+    ):
+        return True
+    if low.startswith(("instagram post (", "amazon item ", "video by ", "tiktok video by ", "x post by ")):
+        return True
+    if len(cname) == 11 and cname.lower() in url.lower():
+        return True
+    if _IG_RE.search(url):
+        from stages.s3_collectors.instagram_collector import _extract_shortcode
+        _sc = _extract_shortcode(url)
+        if _sc and low.replace(" ", "_") == _sc.lower():
+            return True
+    return False
+
+
 async def analyze_input(
     url: str,
     progress_cb=None,
@@ -813,19 +861,11 @@ async def analyze_input(
         url = f"https://{url}"
 
     cache = get_cache()
-    cache_key = f"v2::{url}"
+    cache_key = f"v3::{url}"
     cached = cache.get("s1_topic", cache_key)
     if cached:
         topic_cached = TopicProfile.model_validate(cached)
-        # Ignore stale cache if title fell back to a raw YouTube ID, Instagram shortcode slug, or "Video by ..."
-        cname = (topic_cached.canonical_name or "").strip()
-        is_stale_title = (len(cname) == 11 and cname.lower() in url.lower()) or cname.lower().startswith("video by ")
-        if _IG_RE.search(url) and not is_stale_title:
-            from stages.s3_collectors.instagram_collector import _extract_shortcode
-            _sc = _extract_shortcode(url)
-            if _sc and cname.lower().replace(" ", "_") == _sc.lower():
-                is_stale_title = True
-        if not is_stale_title:
+        if not _is_generic_fallback_title(topic_cached.canonical_name, url):
             logger.info(f"Stage 1: cache hit for {url}")
             return topic_cached, []
 
@@ -880,6 +920,7 @@ async def analyze_input(
     topic = await _llm_extract_topic(content_text, input_type, url=url)
 
     logger.info(f"Stage 1: Identified topic '{topic.canonical_name}'")
-    cache.set("s1_topic", cache_key, topic.model_dump())
+    if not _is_generic_fallback_title(topic.canonical_name, url):
+        cache.set("s1_topic", cache_key, topic.model_dump())
 
     return topic, extra_urls
