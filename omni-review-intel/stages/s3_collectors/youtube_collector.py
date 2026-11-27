@@ -731,8 +731,8 @@ async def _collect_via_innertube_curl(
         started_at = time.monotonic()
         container_mb = get_container_memory_limit_mb()
         is_constrained = bool(container_mb is not None and container_mb <= 2048.0)
-        max_pagination_secs = 90.0 if is_constrained else 180.0
-        max_phase3_secs = 35.0 if is_constrained else 60.0
+        max_pagination_secs = 75.0 if is_constrained else 180.0
+        max_phase3_secs = 25.0 if is_constrained else 60.0
 
         comments: list[RawComment] = []
         seen_ids: set[str] = set()

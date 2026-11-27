@@ -5,6 +5,7 @@ All pipeline tuning parameters live here; nothing is hardcoded elsewhere.
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import os
 from pathlib import Path
 import threading
 from typing import Any, Iterator, Optional
@@ -194,6 +195,7 @@ def get_container_memory_limit_mb() -> Optional[float]:
     """Return Linux cgroup memory limit in MiB when running in a memory-bounded container."""
     for cg_path in (
         Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory.high"),
         Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
     ):
         try:
@@ -208,6 +210,8 @@ def get_container_memory_limit_mb() -> Optional[float]:
                 return limit_bytes / (1024.0 * 1024.0)
         except Exception:
             continue
+    if os.environ.get("RAILWAY_SERVICE_ID") or os.environ.get("RAILWAY_PROJECT_ID"):
+        return 1024.0
     return None
 
 
@@ -216,7 +220,7 @@ def effective_max_comments(is_target: bool = True) -> int:
     requested = int(settings.max_comments_per_url or 0)
     limit_mb = get_container_memory_limit_mb()
     if limit_mb is not None and limit_mb <= 2048.0:
-        safe_target = 12_000 if limit_mb <= 1300.0 else 25_000
+        safe_target = 15_000 if limit_mb <= 1300.0 else 25_000
         safe_secondary = 1_000
         cap = safe_target if is_target else safe_secondary
         return cap if requested <= 0 else min(requested, cap)
