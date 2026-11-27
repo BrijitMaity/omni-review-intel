@@ -133,3 +133,10 @@ def test_youtube_transcript_supports_legacy_and_v1_api():
             assert s1._fetch_youtube_transcript_sync("abc123") == "Great review"
         with patch.object(s1, "YouTubeTranscriptApi", _V1Api):
             assert s1._fetch_youtube_transcript_sync("xyz789") == "Hello world"
+
+
+def test_social_url_slug_fallbacks_avoid_numeric_ids():
+    from stages.s1_input_analyzer import _extract_title_from_text_or_url
+
+    assert _extract_title_from_text_or_url("URL: https://www.tiktok.com/@bellapoarch/video/6862153058223197445", "https://www.tiktok.com/@bellapoarch/video/6862153058223197445") == "TikTok Video by @bellapoarch"
+    assert _extract_title_from_text_or_url("URL: https://x.com/jack/status/20", "https://x.com/jack/status/20") == "X Post by @jack"

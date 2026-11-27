@@ -482,16 +482,22 @@ def _scrape_html_chrome_sync(url: str) -> str:
             return f"Title: {headline}\nUploader: {uploader}\nDescription: {og_desc[:2000]}"
 
         clean_title = _clean_flipkart_or_ecommerce_title(raw_title)
-        # Reject generic soft-error / login placeholder titles
+        # Reject generic soft-error / login / JS-challenge placeholder titles
         if clean_title.lower() in (
             "sign in",
             "log in to facebook",
             "facebook",
+            "instagram",
+            "tiktok",
+            "tiktok - make your day",
+            "reddit - dive into anything",
             "amazon.com",
             "amazon.in",
             "robot check",
             "sorry! something went wrong!",
+            "access denied",
             "just a moment...",
+            "page not found",
             "buy products online at best price in india - all categories",
         ):
             clean_title = ""
@@ -499,7 +505,7 @@ def _scrape_html_chrome_sync(url: str) -> str:
         for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
             tag.decompose()
         text = " ".join(soup.stripped_strings)
-        if clean_title or og_desc or len(text) > 100:
+        if clean_title or og_desc or (len(text) > 100 and "tiktok - make your day" not in raw_title.lower()):
             return f"Title: {clean_title}\nDescription: {og_desc}\n\nContent:\n{text[:5000]}"
     except Exception as e:
         logger.debug(f"Chrome Stage 1 scrape failed for {url}: {e}")
@@ -641,9 +647,15 @@ def _extract_title_from_text_or_url(content_text: str, url: str) -> str:
     if "instagram" in parsed.netloc.lower() or "instagr.am" in parsed.netloc.lower():
         for i, p in enumerate(parts):
             if p.lower() in ("p", "reel", "reels", "tv") and i + 1 < len(parts):
-                if i > 0:
+                if i > 0 and parts[i - 1].lower() != "share":
                     return f"Instagram Post by {parts[i - 1]}"
                 return f"Instagram Post ({parts[i + 1]})"
+    if "tiktok.com" in parsed.netloc.lower():
+        creators = [p for p in parts if p.startswith("@")]
+        if creators:
+            return f"TikTok Video by {creators[0]}"
+    if ("x.com" in parsed.netloc.lower() or "twitter.com" in parsed.netloc.lower()) and len(parts) >= 3 and parts[1].lower() == "status":
+        return f"X Post by @{parts[0]}"
     for i, p in enumerate(parts):
         if p.lower() in ("dp", "p", "product-reviews", "product", "item") and i > 0:
             slug = parts[i - 1]
