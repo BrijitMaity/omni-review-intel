@@ -1115,7 +1115,7 @@ async def _collect_via_innertube_curl(
                     ws,
                     w_prof,
                     cur_tok,
-                    max_attempts=2,
+                    max_attempts=3,
                     req_timeout=15,
                     update_shared_state=False,
                     fixed_visitor=visitor_data,
@@ -1211,7 +1211,7 @@ async def _collect_via_innertube_curl(
             if not cursor_tasks:
                 cursors_done.set()
 
-            reply_worker_count = 4
+            reply_worker_count = 2
             with ThreadPoolExecutor(max_workers=len(cursor_tasks) + reply_worker_count) as pool:
                 futs = [pool.submit(_cursor_runner, t, nm) for t, nm in cursor_tasks]
                 for w_i in range(reply_worker_count):
