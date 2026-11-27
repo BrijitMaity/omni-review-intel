@@ -110,3 +110,26 @@ def test_flipkart_long_title_cleaning_and_concise_search_queries():
     profile = _fallback_topic_profile(f"Title: {cleaned}\n\nContent:\nGreat audio", "product", "https://www.flipkart.com/sony-wh-1000xm5/p/itm123")
     assert all(not q.endswith("with review") for q in profile.search_queries)
     assert any(q.startswith("SONY WH-1000XM5") and q.endswith("review") for q in profile.search_queries)
+
+
+def test_youtube_transcript_supports_legacy_and_v1_api():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from stages import s1_input_analyzer as s1
+
+    class _LegacyApi:
+        @staticmethod
+        def get_transcript(vid_id: str):
+            assert vid_id == "abc123"
+            return [{"text": "Great"}, {"text": "review"}]
+
+    class _V1Api:
+        def fetch(self, vid_id: str):
+            assert vid_id == "xyz789"
+            return [SimpleNamespace(text="Hello"), SimpleNamespace(text="world")]
+
+    with patch.object(s1, "_TRANSCRIPT_AVAILABLE", True):
+        with patch.object(s1, "YouTubeTranscriptApi", _LegacyApi):
+            assert s1._fetch_youtube_transcript_sync("abc123") == "Great review"
+        with patch.object(s1, "YouTubeTranscriptApi", _V1Api):
+            assert s1._fetch_youtube_transcript_sync("xyz789") == "Hello world"

@@ -33,6 +33,7 @@ except ImportError:
     pass
 
 _TRANSCRIPT_AVAILABLE = False
+YouTubeTranscriptApi = None  # type: ignore[assignment]
 try:
     from youtube_transcript_api import YouTubeTranscriptApi  # noqa: F401
     _TRANSCRIPT_AVAILABLE = True
@@ -264,6 +265,23 @@ async def _fetch_ig_metadata_http(url: str) -> dict | None:
     return await asyncio.to_thread(_fetch)
 
 
+def _fetch_youtube_transcript_sync(vid_id: str) -> str:
+    """Fetch up to 120 transcript snippets across youtube-transcript-api v0.6 and v1+."""
+    if not (_TRANSCRIPT_AVAILABLE and YouTubeTranscriptApi is not None and vid_id):
+        return ""
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+        entries = YouTubeTranscriptApi.get_transcript(vid_id)
+    else:
+        entries = YouTubeTranscriptApi().fetch(vid_id)
+    parts: list[str] = []
+    for entry in list(entries)[:120]:
+        text = entry.get("text", "") if isinstance(entry, dict) else getattr(entry, "text", "")
+        cleaned = str(text or "").strip()
+        if cleaned:
+            parts.append(cleaned)
+    return " ".join(parts)
+
+
 async def _extract_video_metadata(url: str) -> dict:
     """Use yt-dlp to extract video metadata without downloading, with HTTP fallbacks."""
     if _IG_RE.search(url):
@@ -304,8 +322,7 @@ async def _extract_video_metadata(url: str) -> dict:
                 try:
                     vid_id: str = info.get("id", "")
                     if vid_id:
-                        entries = YouTubeTranscriptApi.get_transcript(vid_id)
-                        transcript_text = " ".join(e["text"] for e in entries[:120])
+                        transcript_text = await asyncio.to_thread(_fetch_youtube_transcript_sync, vid_id)
                 except Exception as te:
                     logger.debug(f"Transcript fetch skipped: {te}")
 
