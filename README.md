@@ -199,8 +199,4 @@ All tunable in `.env` or `config.py`:
 - **Public data only**: Official APIs (YouTube Data API, Reddit PRAW) and publicly accessible pages
 - **Concurrency limits**: `asyncio.Semaphore` prevents API rate-limit hammering
 
----
-
-## 📜 License
-
-MIT
+--
