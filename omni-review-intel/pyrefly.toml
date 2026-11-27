@@ -1,0 +1,4 @@
+project-includes = ["."]
+search-path = ["."]
+python-platform = "win32"
+infer-with-first-use = false

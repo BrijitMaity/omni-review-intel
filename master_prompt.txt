@@ -1,0 +1,389 @@
+# MASTER SYSTEM PROMPT & PRODUCTION BLUEPRINT
+# Project: omni-review-intel (Agentic Multimodal Cross-Web Review Intelligence & Structured Excel Reporting System)
+# Version: 2.0.0 Production Edition
+# Target Runtime: Python 3.12+ (Pure Python — Strictly NO React, NO Node.js, NO MongoDB)
+
+---
+
+## PART 1: SYSTEM ARCHITECTURE & LOCKED TECH STACK
+
+Build a complete, production-grade, highly resilient Python application called `omni-review-intel`.
+The application takes any single URL — an e-commerce product link (Amazon, Flipkart, brand stores), a social video (YouTube, Instagram Reel, TikTok), or an image URL / photo — and autonomously discovers cross-web discussions, collects comments across platforms, analyzes sentiments and aspects with structured Map-Reduce LLMs, generates a professional 4-sheet formatted Excel workbook with native charts, and serves both a CLI and an Amazon-standard Streamlit UI.
+
+### 1. Technology Matrix
+
+| Layer | Primary Technology | Fallback / Complementary | Purpose |
+|---|---|---|---|
+| **Language & Runtime** | Python 3.12+ | `asyncio`, `aiohttp`, `threading` | High-throughput concurrent execution without event loop collisions |
+| **Data Validation** | `pydantic` v2 (`BaseModel`, `Field`, `ConfigDict`) | `pydantic-settings` | Strict typed data contracts across all stages and LLM outputs |
+| **Caching & Persistence** | `sqlite3` (built-in standard library) | `@contextmanager` safe connections | Hash-based persistent cache preventing redundant scrapes and LLM costs |
+| **Input Extraction** | `yt-dlp`, `youtube-transcript-api`, `crawl4ai` | `Pillow` (PIL) | Extracts metadata, video transcripts, HTML markdown, and image bytes |
+| **Web Discovery** | `tavily-python` | `serpapi` (Google Lens), `duckduckgo-search` | Multi-query cross-web search and reverse-image discovery |
+| **Collectors** | `google-api-python-client` (YouTube v3), `praw` (Reddit) | `crawl4ai` + `playwright`, optional `apify-client` | Platform-specific comment extraction with guaranteed index parity |
+| **AI Map-Reduce Engine** | `google-genai` (Gemini 2.5 Flash / Pro) | `openai` (GPT-4o / mini) | Multilingual translation, sentiment/aspect tagging, executive synthesis |
+| **Excel Generation** | `openpyxl`, `openpyxl.chart` | `pandas` | Formatted 4-sheet workbook with KPI cards, autofilters, and Pie/Bar charts |
+| **User Interface** | `streamlit` (v1.40+) | Custom Amazon-style CSS injection | High-polish Amazon UX with review breakdown meter and session persistence |
+| **CLI & Automation** | `argparse`, `loguru` | Windows `.bat` launchers | Command-line execution with rich progress reporting |
+| **Automated Testing** | `pytest`, `pytest-asyncio` | `streamlit.testing.v1.AppTest` | 70-test test suite covering all modules, pipeline, and UI |
+
+---
+
+## PART 2: MODULAR PROJECT DIRECTORY STRUCTURE
+
+Maintain strict parity between the root workspace and package directories:
+
+```text
+link_rivew_model/
+├── .env.example                     # Environment template with required & optional keys
+├── requirements.txt                 # Pinned production dependencies
+├── pytest.ini                       # Test configuration (testpaths = tests)
+├── master_prompt.txt                # This comprehensive Master Prompt
+├── main.py                          # Root launcher forwarding to omni-review-intel/main.py
+├── app.py                           # Root launcher forwarding to omni-review-intel/app.py
+├── run_ui.bat                       # Windows double-click launcher for Streamlit UI
+├── run_tests.bat                    # Windows double-click launcher for 70-test suite
+├── run_cli.bat                      # Windows double-click launcher for CLI execution
+├── outputs/                         # Default directory for generated .xlsx reports
+├── tests/                           # Root test forwarding harness (conftest.py, test_ui.py, etc.)
+└── omni-review-intel/               # Core application package
+    ├── config.py                    # Pydantic Settings (caps, models, timeouts)
+    ├── main.py                      # Production CLI entry point
+    ├── app.py                       # Amazon-grade Streamlit web interface
+    ├── pytest.ini                   # Subproject pytest configuration
+    ├── core/
+    │   ├── __init__.py
+    │   ├── schemas.py               # Pydantic v2 models (Topic, Source, Comments, Review, State)
+    │   ├── cache.py                 # SQLite context-managed persistent cache
+    │   └── pipeline.py              # 5-stage async orchestrator with progress callbacks
+    ├── stages/
+    │   ├── __init__.py
+    │   ├── _llm_client.py           # Unified Gemini / OpenAI client with caching & fallback
+    │   ├── s1_input_analyzer.py     # URL classifier, multimodal/video metadata extractor
+    │   ├── s2_web_discovery.py      # LLM query expansion, Tavily/SerpApi search, deduplicator
+    │   ├── s3_collectors/
+    │   │   ├── __init__.py
+    │   │   ├── router.py            # Domain dispatcher with defensive index preservation
+    │   │   ├── youtube_collector.py # Official YouTube Data API v3 collector
+    │   │   ├── reddit_collector.py  # Official Reddit PRAW comment collector
+    │   │   ├── web_collector.py     # Crawl4AI + LLM fallback comment extractor
+    │   │   └── apify_collector.py   # Optional plugin for Amazon / Instagram / TikTok
+    │   ├── s4_ai_analyzer.py        # Map-Reduce sentiment/aspect analyzer & statistical reducer
+    │   └── s5_excel_builder.py      # 4-sheet openpyxl builder with native embedded charts
+    ├── prompts/
+    │   ├── entity_extraction.txt    # Stage 1 Topic identification prompt
+    │   ├── batch_comment_eval.txt   # Stage 4 Map phase comment tagging prompt
+    │   └── executive_review.txt     # Stage 4 Reduce phase executive review prompt
+    └── tests/
+        ├── conftest.py
+        ├── test_cache.py            # Cache read/write/clear/stats tests (8 tests)
+        ├── test_excel_builder.py    # Excel sheets, charts, hyperlinks tests (12 tests)
+        ├── test_pipeline.py         # Full 5-stage end-to-end integration test (1 test)
+        ├── test_router.py           # URL classification, filtering & routing tests (12 tests)
+        ├── test_s1_input_analyzer.py# S1 metadata extraction & fallback tests (8 tests)
+        ├── test_s4_ai_analyzer.py   # S4 Map-Reduce & statistics tests (7 tests)
+        ├── test_schemas.py          # Pydantic model validation tests (14 tests)
+        └── test_ui.py               # Streamlit AppTest GUI test suite (8 tests)
+```
+
+---
+
+## PART 3: DATA CONTRACTS & SCHEMAS (`core/schemas.py`)
+
+All cross-stage communication and LLM structured outputs must adhere strictly to Pydantic v2 models:
+
+```python
+from __future__ import annotations
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+
+InputType = Literal["product", "video", "image", "article"]
+PlatformType = Literal["Amazon", "YouTube", "Reddit", "Flipkart", "Twitter", "Instagram", "TikTok", "Web"]
+
+class TopicProfile(BaseModel):
+    canonical_name: str
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    input_type: InputType = "product"
+    short_description: str = ""
+    search_queries: list[str] = Field(default_factory=list)
+    visual_keywords: list[str] = Field(default_factory=list)
+
+class DiscoveredSource(BaseModel):
+    source_id: str = Field(default_factory=lambda: f"src_{uuid.uuid4().hex[:8]}")
+    url: str
+    domain: str = ""
+    platform: PlatformType = "Web"
+    title: str = ""
+    snippet: str = ""
+    scrape_status: Literal["pending", "success", "partial", "failed", "skipped"] = "pending"
+    comments_collected: int = 0
+    positive_pct: float = 0.0
+    neutral_pct: float = 0.0
+    negative_pct: float = 0.0
+    error_message: Optional[str] = None
+
+    @field_validator("platform", mode="before")
+    @classmethod
+    def normalize_platform(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if "amazon" in s: return "Amazon"
+        if "youtube" in s or "youtu.be" in s: return "YouTube"
+        if "reddit" in s: return "Reddit"
+        if "flipkart" in s: return "Flipkart"
+        if "twitter" in s or "x.com" in s: return "Twitter"
+        if "instagram" in s: return "Instagram"
+        if "tiktok" in s: return "TikTok"
+        return "Web"
+
+class RawComment(BaseModel):
+    comment_id: str
+    source_url: str
+    platform: PlatformType = "Web"
+    author: str = "Anonymous"
+    published_date: str = ""
+    rating: Optional[float] = None
+    original_text: str
+
+    @field_validator("original_text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v: raise ValueError("original_text must not be empty")
+        return v
+
+class AnalyzedComment(RawComment):
+    original_language: str = "English"
+    english_text: str = ""
+    sentiment: Literal["Positive", "Neutral", "Negative"] = "Neutral"
+    confidence_score: float = Field(default=0.8, ge=0.0, le=1.0)
+    aspect_tag: str = "General"
+    is_spam: bool = False
+    spam_reason: Optional[str] = None
+
+class BatchAnalysisResult(BaseModel):
+    comments: list[AnalyzedComment] = Field(default_factory=list)
+
+class AspectSummary(BaseModel):
+    aspect_name: str
+    mention_count: int = 0
+    positive_pct: float = 0.0
+    neutral_pct: float = 0.0
+    negative_pct: float = 0.0
+    key_takeaway: str = ""
+
+class ExecutiveReview(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    topic_name: str
+    original_url: str
+    overall_sentiment: Literal["Positive", "Neutral", "Negative"] = "Neutral"
+    ai_score_out_of_10: float = Field(default=5.0, ge=0.0, le=10.0)
+    executive_summary: str
+    top_pros: list[str] = Field(default_factory=list)
+    top_cons: list[str] = Field(default_factory=list)
+    common_complaints: list[str] = Field(default_factory=list)
+    platform_comparison_notes: str = ""
+    buying_or_action_verdict: str = ""
+    aspect_summaries: list[AspectSummary] = Field(default_factory=list)
+
+class PipelineState(BaseModel):
+    input_url: str
+    topic: Optional[TopicProfile] = None
+    sources: list[DiscoveredSource] = Field(default_factory=list)
+    raw_comments: list[RawComment] = Field(default_factory=list)
+    analyzed_comments: list[AnalyzedComment] = Field(default_factory=list)
+    executive_review: Optional[ExecutiveReview] = None
+    output_xlsx_path: str = ""
+    total_comments_raw: int = 0
+    total_comments_valid: int = 0
+    positive_pct: float = 0.0
+    neutral_pct: float = 0.0
+    negative_pct: float = 0.0
+```
+
+---
+
+## PART 4: FIVE-STAGE DETERMINISTIC PIPELINE
+
+### Stage 1: Input Analysis & Topic Identification (`stages/s1_input_analyzer.py`)
+- Regex-classify URL into: `product`, `video`, `image`, or `article`.
+- If **Image**: Stream image bytes (max 10MB limit), invoke Multimodal Gemini Flash with `prompts/entity_extraction.txt`, and query SerpApi Google Lens for reverse-image matching URLs.
+- If **Video**: Call `yt-dlp` (with `--dump-single-json` / flat metadata, no media download) and `youtube-transcript-api` to extract title, channel, description, and transcript snippet. Synthesize with LLM into `TopicProfile`.
+- If **Product / Article**: Fetch clean page Markdown via `crawl4ai` (or `aiohttp` fallback), extract OpenGraph/JSON-LD metadata, and pass to LLM to produce `TopicProfile` with canonical name, brand, category, and exactly 5 high-signal review search queries.
+
+### Stage 2: Web & Cross-Platform Discovery (`stages/s2_web_discovery.py`)
+- Concurrently execute the 5 generated search queries using Tavily (`tavily-python`) with fallbacks to SerpApi Google Search and `duckduckgo-search`.
+- Merge any reverse-image match URLs discovered in Stage 1. Always place the original user input URL at index 0.
+- URL Normalization: Strip tracking parameters (`utm_*`, `ref`, `fbclid`, `gclid`), lowercase hostnames, and discard junk links (PDFs, privacy policies, terms, login pages).
+- Deduplicate by canonical URL string. Rank and cap results at `MAX_DISCOVERED_URLS` (default: 15).
+
+### Stage 3: Domain-Routed Concurrent Collectors (`stages/s3_collectors/router.py`)
+- Router dispatches each `DiscoveredSource` to its specialized collector using `asyncio.gather` bounded by `asyncio.Semaphore(MAX_CONCURRENT_SCRAPES)`:
+  - **YouTube URLs**: `stages/s3_collectors/youtube_collector.py` using `google-api-python-client` (`commentThreads().list(order='relevance')`). Ignore empty comment strings.
+  - **Reddit URLs**: `stages/s3_collectors/reddit_collector.py` using official `praw` Reddit API to crawl submission comments and top replies.
+  - **General Web / Flipkart / Blogs**: `stages/s3_collectors/web_collector.py` using `crawl4ai` + Playwright to extract Markdown. Uses a fast LLM parsing prompt if structured HTML review tags are absent. Includes robust markdown code-fence stripping and regex fallback for code-fenced JSON responses.
+  - **Protected Socials (Instagram / TikTok / Amazon)**: `stages/s3_collectors/apify_collector.py` if `APIFY_API_KEY` is present; otherwise gracefully logs `status="skipped"` without crashing.
+- **Index Parity Guarantee**: The router must defensively use indexed assignment so that `len(updated_sources) == len(sources)` under all circumstances, even upon unexpected collector exceptions.
+
+### Stage 4: Map-Reduce AI Analysis & Review Synthesis (`stages/s4_ai_analyzer.py`)
+- **Pre-clean**: Deduplicate identical comments per source, strip trailing whitespace, and filter out short empty strings.
+- **Map Phase**: Chunk raw comments into concurrent batches of `LLM_BATCH_SIZE` (default: 30). Concurrently execute LLM calls using `prompts/batch_comment_eval.txt` bound to `BatchAnalysisResult`:
+  - Detect original language (e.g. Hindi, Hinglish, Spanish, German).
+  - Provide a clean, faithful English translation.
+  - Classify sentiment strictly into `"Positive"`, `"Neutral"`, or `"Negative"`.
+  - Assign a 1-2 word aspect tag (`ANC`, `Sound Quality`, `Battery`, `Price`, `Comfort`, `Design`, `Customer Support`).
+  - Flag spam / promotional bots (`is_spam = True`).
+- **Statistical Reduce Phase**:
+  - Filter out comments where `is_spam == True`.
+  - Compute exact Python/pandas statistics: total valid count, overall positive/neutral/negative percentages, per-platform sentiment breakdown, and per-aspect frequency and sentiment distributions.
+  - Select representative positive, neutral, and negative comment quotes for each platform.
+- **Executive Synthesis**:
+  - Send the deterministic stats and representative comments to the reasoning model (Gemini Pro) using `prompts/executive_review.txt`.
+  - Output strict `ExecutiveReview` object with AI score (0.0-10.0), top pros, top cons, recurring complaints, platform comparison notes, and buying verdict.
+
+### Stage 5: Structured Excel Workbook Builder (`stages/s5_excel_builder.py`)
+Generate a styled Microsoft Excel (`.xlsx`) workbook containing 4 sheets using `openpyxl`:
+1. **Sheet 1: `Executive Review`**:
+   - Styled dark navy header block (`#232F3E`), topic metadata, AI score badge, and KPI summary.
+   - Top 5 Pros, Top 5 Cons, and Actionable Verdict callout.
+   - Embedded native **openpyxl `PieChart`** displaying Positive vs. Neutral vs. Negative distribution.
+2. **Sheet 2: `Aspect & Platform Breakdown`**:
+   - Platform sentiment summary table with totals and percentage shares.
+   - Aspect-level sentiment matrix (mention count, % positive, % neutral, % negative, key takeaway).
+   - Embedded native **openpyxl `BarChart`** comparing sentiments across platforms.
+3. **Sheet 3: `Discovered Sources`**:
+   - Audit trail of all discovered URLs: Source ID, Platform, Page Title, Clickable Hyperlink, Comments Collected, Sentiment Breakdown, and Status color fills (Green = Success, Yellow = Partial, Red = Failed, Gray = Skipped).
+4. **Sheet 4: `All Reviews & Comments`**:
+   - Master dataset: Comment ID, Platform, Source URL, Author, Published Date, Original Language, Original Comment, English Translation, Sentiment, Confidence Score, Aspect Tag, and Spam Flag.
+   - Frozen header row (`A2`), enabled AutoFilter across all columns, text wrap enabled, column widths auto-fitted and capped at 55 characters, and conditional row fills (Light Green = Positive, Light Gray = Neutral, Light Red = Negative).
+
+---
+
+## PART 5: AMAZON-GRADE STREAMLIT UI SPECIFICATIONS (`app.py`)
+
+The Streamlit UI must match Amazon's design standards and maintain strict production robustness:
+
+1. **Amazon Visual Identity**:
+   - Clean white background (`#FFFFFF`), Amazon Dark Navy header and sidebar (`#232F3E`), and signature Amazon Gold/Orange buttons (`#F0C14B` / `#FF9900`).
+   - Clean typography using standard Amazon Ember fallback font stacks.
+2. **Session State Persistence (`st.session_state.analysis_state`)**:
+   - All state must be preserved in `st.session_state`.
+   - Clicking the Excel Download CTA or switching between tabs must NEVER wipe the page or reset the analysis.
+3. **Amazon Customer Review Breakdown Meter**:
+   - Horizontal percentage progress tracks displaying the exact proportions of Positive (Emerald Green `#067D62`), Neutral (Slate Gray `#767676`), and Negative (Crimson Red `#C45500`) reviews.
+4. **"✨ Customers say" AI Overview Card**:
+   - Prominently styled Amazon-style AI summary card summarizing user sentiment.
+   - Interactive aspect chips (`ANC`, `Sound Quality`, `Battery`, `Comfort`, `Price`, `Design`).
+5. **Side-by-Side Pros & Cons & Actionable Verdict**:
+   - Two-column cards: Left card for strengths (`pro-card`), Right card for critical drawbacks (`con-card`).
+   - Amazon recommendation callout box (`verdict-box`) advising the user on purchase decisions.
+6. **Quick Test Shortcuts**:
+   - Three instant shortcut buttons below the URL input:
+     - `🎧 Sample: Sony WH-1000XM5`
+     - `📱 Sample: iPhone 16 Pro`
+     - `🔄 Clear / Reset`
+   - Enables immediate verification of the full UI, metrics, and Excel generation without needing API keys.
+7. **Thread-Safe Async Pipeline Execution**:
+   - Executes the async pipeline inside a dedicated background thread with a fresh event loop and thread-safe queue (`queue.Queue`) to prevent Streamlit Tornado event loop crashes.
+8. **Interactive 4-Tab Workspace**:
+   - *Tab 1: 📊 Customer Review Overview* (Aspect table, Pros/Cons, Verdict).
+   - *Tab 2: 🌐 Discovered Sources* (Interactive dataframe of discovered links and scrape statuses).
+   - *Tab 3: 💬 Customer Reviews* (Searchable, platform-filterable, and sentiment-filterable review explorer).
+   - *Tab 4: 📈 Analytics & Charts* (Plotly charts for sentiment breakdown and aspect frequencies).
+
+---
+
+## PART 6: PERSISTENCE, WINDOWS SAFETY & TIME COMPLEXITY
+
+1. **SQLite Connection Safety on Windows**:
+   - All SQLite operations in `core/cache.py` must use a generator-based context manager (`@contextmanager def _connection()`) that guarantees `conn.close()` even if queries fail, avoiding Windows NTFS file lock errors (`PermissionError: [WinError 32]`).
+2. **Time & Space Complexity**:
+   - Data cleaning and deduplication: strictly $O(n)$ using hash sets.
+   - Batch chunking: strictly $O(n)$ with $O(1)$ memory slices.
+   - Map phase: Concurrently bounded to $O(n / \text{batch\_size})$ LLM invocations using `asyncio.gather`.
+   - Reduce phase: Deterministic $O(n)$ single-pass aggregation.
+3. **Resilient JSON Parsing**:
+   - Every LLM response parser must include markdown code-fence stripping (`strip().removeprefix("```json").removesuffix("```")`) and structured regex fallbacks to prevent runtime crashes from model formatting variations.
+
+---
+
+## PART 7: AUTOMATED TESTING SUITE (70 TESTS)
+
+Provide a comprehensive `pytest` test suite covering 100% of functional requirements:
+- `tests/test_cache.py` (8 tests): Set/get, cache miss, has, overwrite, delete, namespace clearing, stats, multi-type serialization.
+- `tests/test_excel_builder.py` (12 tests): File creation, 4 required sheets, title validation, hyperlinks, frozen panes, autofilters, PieChart presence, BarChart presence.
+- `tests/test_pipeline.py` (1 test): Complete 5-stage async pipeline execution with progress callbacks and mock data.
+- `tests/test_router.py` (12 tests): URL classification (YouTube, Instagram, Amazon, image, article), UTM parameter stripping, canonicalization, junk URL filtering, platform detection (including Flipkart & Twitter), collector routing, and exception isolation.
+- `tests/test_s1_input_analyzer.py` (8 tests): Classification regex, fallback handlers, video metadata error handling, content-type checks, crawl4ai markdown fallbacks.
+- `tests/test_s4_ai_analyzer.py` (7 tests): Deduplication, empty comment stripping, batch chunking, statistical calculation accuracy, comment sampling, stub review creation.
+- `tests/test_schemas.py` (14 tests): Pydantic model instantiations, validators, score bounds, custom stats, and serialization.
+- `tests/test_ui.py` (8 tests via `streamlit.testing.v1.AppTest`):
+  - Initial clean page render (0 exceptions).
+  - Empty URL validation warning display.
+  - Quick sample Sony shortcut execution & state population.
+  - Quick sample iPhone shortcut execution.
+  - Clear / Reset state clearing.
+  - Session state persistence across reruns (simulating download button clicks).
+  - Sidebar demo mode checkbox toggle.
+  - Direct testing of `_stars_html` and `_sentiment_pill` helpers.
+
+Both root `python -m pytest tests/` and subdirectory `cd omni-review-intel; python -m pytest` must pass 70/70 tests without failure.
+
+---
+
+## PART 8: PRODUCTION RUNTIME LLM PROMPTS
+
+Save the following exact prompt files in `omni-review-intel/prompts/`:
+
+### 1. `prompts/entity_extraction.txt` (Stage 1)
+```text
+You are a precise Entity & Topic Identification Specialist.
+Analyze the provided webpage Markdown, video metadata/transcript, or image to determine the exact product, media item, or core public topic being referenced.
+
+Rules:
+- Extract the exact canonical name (include brand + model number if it is a product, e.g., "Sony WH-1000XM5 Wireless Headphones").
+- Generate exactly 5 high-signal web search queries designed to find real user reviews, discussions, and comment threads across Reddit, YouTube, review blogs, and e-commerce sites.
+- Avoid generic queries; include terms like "review", "reddit", "problems", "worth it", or "pros and cons".
+- Return ONLY valid JSON matching the `TopicProfile` schema.
+```
+
+### 2. `prompts/batch_comment_eval.txt` (Stage 4 — Map Phase)
+```text
+You are a Multilingual Review & Sentiment Analysis Engine.
+You will receive a JSON array of raw user comments/reviews collected for the topic: "{topic_name}".
+
+For EVERY item in the input array, produce a matching `AnalyzedComment` entry:
+1. Detect `original_language` (ISO name, e.g., English, Hindi, Hinglish, Bengali, Spanish).
+2. Write `english_text`: a faithful, concise English translation or clean normalized version of the comment. Do not invent facts.
+3. Classify `sentiment` strictly as "Positive", "Neutral", or "Negative" based ONLY on the user's opinion toward "{topic_name}".
+4. Assign `confidence_score` between 0.0 and 1.0.
+5. Assign a short, consistent 1-2 word `aspect_tag` (e.g., "Quality", "Price", "Battery", "Customer Support", "Design", "Performance", "General").
+6. Set `is_spam = true` ONLY for promotional links, bot replies, gibberish, or completely off-topic comments unrelated to "{topic_name}".
+7. Preserve exact `comment_id` and `source_url` from the input. Return ONLY valid JSON matching `BatchAnalysisResult`.
+```
+
+### 3. `prompts/executive_review.txt` (Stage 4 — Reduce Phase)
+```text
+You are a Senior Consumer Research Analyst writing an objective, data-backed Executive Review for "{topic_name}".
+
+You are given:
+1. Exact aggregated statistics computed across all valid (non-spam) comments and platforms.
+2. Representative positive, neutral, and negative user comments from each platform.
+
+Rules:
+- Base every claim strictly on the provided statistics and comment evidence. Never hallucinate features or numbers.
+- Calculate `ai_score_out_of_10` proportionally from sentiment balance and severity of recurring defects.
+- Highlight differences across platforms if noticeable (e.g., if YouTube commenters praise visuals while Reddit users report durability issues).
+- Keep `top_pros`, `top_cons`, and `common_complaints` crisp, specific, and non-redundant (3 to 5 bullets each).
+- Write a clear, practical `buying_or_action_verdict` telling the reader who this topic/product is best for and what risks to watch out for.
+- Return ONLY valid JSON matching the `ExecutiveReview` schema.
+```
+
+---
+
+## PART 9: EXECUTION & VERIFICATION INSTRUCTIONS
+
+When implementing or executing this specification:
+1. Ensure Python 3.12 is active and all packages in `requirements.txt` are installed.
+2. Ensure `.env` is loaded with `GEMINI_API_KEY` (or use built-in Demo Mode / Quick Test Shortcuts for zero-key evaluation).
+3. Verify test suite with `.\run_tests.bat` or `python -m pytest tests/ -v` (Must pass 70/70 tests).
+4. Launch the web application with `.\run_ui.bat` or `python -m streamlit run app.py` (accessible at `http://localhost:8501`).

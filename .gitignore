@@ -1,0 +1,29 @@
+# Secrets & environment
+.env
+**/.env
+.streamlit/secrets.toml
+**/.streamlit/secrets.toml
+
+# Local cache databases & generated reports
+cache.db
+*.db
+*.db-wal
+*.db-shm
+outputs/
+omni-review-intel/outputs/
+*.xlsx
+app.log
+
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.vscode/
+*.egg-info/
+dist/
+build/
+0.26.0
