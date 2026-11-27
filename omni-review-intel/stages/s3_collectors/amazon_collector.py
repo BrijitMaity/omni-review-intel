@@ -180,13 +180,20 @@ def _parse_amazon_reviews_html(
     }
 
 
+def _normalize_cookie_header(raw: str) -> str:
+    txt = (raw or "").strip().strip('"').strip("'")
+    if txt.lower().startswith("cookie:"):
+        txt = txt.split(":", 1)[1].strip()
+    return txt
+
+
 def _collect_amazon_sync(
     source: DiscoveredSource,
     asin: str | None,
     max_items: int | None,
 ) -> dict[str, Any]:
-    """Fetch Amazon reviews synchronously across product-reviews pagination & /dp/ page."""
-    cookies = settings.amazon_cookie.strip() if settings.has_amazon_cookie else ""
+    """Fetch Amazon reviews synchronously across product-reviews pagination & /dp/ page with TLS retry on CAPTCHA."""
+    cookies = _normalize_cookie_header(settings.amazon_cookie) if settings.has_amazon_cookie else ""
     sess = create_chrome_session(cookies=cookies)
     if sess is None:
         return {"comments": [], "total_reported": 0, "signin_walled": False, "captcha_walled": False}
@@ -269,6 +276,39 @@ def _collect_amazon_sync(
             if dp_resp.status_code == 200 and "/ap/signin" not in str(getattr(dp_resp, "url", dp_url)):
                 _merge(_parse_amazon_reviews_html(dp_resp.text, resolved_asin, source))
 
+        # If initial session hit a CAPTCHA/empty wall on cloud IP, try alternate browser TLS impersonations & mobile /gp/aw/d/
+        if not comments and resolved_asin != "item":
+            try:
+                from curl_cffi import requests as c_requests
+            except ImportError:
+                c_requests = None
+            alt_urls = [f"https://{host}/dp/{resolved_asin}", f"https://{host}/gp/aw/d/{resolved_asin}"]
+            if c_requests is not None:
+                for imp in ("safari17_0", "chrome124"):
+                    if comments:
+                        break
+                    alt_sess = None
+                    try:
+                        alt_cookies = {"cookie": cookies} if cookies else None
+                        alt_sess = c_requests.Session(impersonate=imp)
+                        if cookies:
+                            alt_sess.headers.update({"Cookie": cookies})
+                        for au in alt_urls:
+                            ar = alt_sess.get(au, headers=headers, timeout=15)
+                            if ar.status_code == 200 and ar.text and "/ap/signin" not in str(getattr(ar, "url", au)):
+                                _merge(_parse_amazon_reviews_html(ar.text, resolved_asin, source))
+                                if comments:
+                                    captcha_walled = False
+                                    break
+                    except Exception:
+                        pass
+                    finally:
+                        if alt_sess is not None:
+                            try:
+                                alt_sess.close()
+                            except Exception:
+                                pass
+
     except Exception as e:
         logger.warning(f"Amazon scrape failed for {source.url}: {e}")
     finally:
@@ -291,7 +331,7 @@ async def collect_amazon(source: DiscoveredSource) -> tuple[list[RawComment], Di
     host = urlparse(source.url).netloc.lower()
     max_items: int | None = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
     auth_mode = 2 if settings.has_apify else (1 if settings.has_amazon_cookie else 0)
-    cache_id = f"amazon_v2::{host}::{asin or source.url}::{auth_mode}::{settings.max_comments_per_url}"
+    cache_id = f"amazon_v3::{host}::{asin or source.url}::{auth_mode}::{settings.max_comments_per_url}"
 
     cache = get_cache()
     cached = cache.get("s3_amazon", cache_id)

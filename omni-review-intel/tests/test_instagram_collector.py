@@ -321,3 +321,64 @@ def test_instagram_extracts_single_emoji_comments_without_false_login_wall():
     assert len(parsed["comments"]) == 2
     assert parsed["comments"][0].original_text == "🙌"
     assert parsed["login_walled"] is False
+
+
+def test_instagram_share_link_cookie_parsing_and_shortcode_to_media_id():
+    from types import SimpleNamespace
+    from stages.s3_collectors.instagram_collector import (
+        _fetch_post_html_sync,
+        _parse_ig_cookie_dict,
+        _resolve_share_shortcode_sync,
+        _shortcode_to_media_id,
+    )
+
+    assert _shortcode_to_media_id("DgMZ0QMTquh") == "4038716507806411681"
+
+    parsed_full = _parse_ig_cookie_dict("Cookie: csrftoken=abc; ds_user_id=999; sessionid=12345%3Asecret%3A9")
+    assert parsed_full["sessionid"] == "12345%3Asecret%3A9"
+    assert parsed_full["csrftoken"] == "abc"
+    assert parsed_full["ds_user_id"] == "999"
+
+    class _ShareSess:
+        def get(self, url, **kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                url="https://www.instagram.com/reel/DgMZ0QMTquh/",
+                text="<html></html>",
+            )
+
+        def close(self):
+            pass
+
+    with patch("stages.s3_collectors.instagram_collector._create_http_session", return_value=_ShareSess()):
+        sc, canon = _resolve_share_shortcode_sync("https://www.instagram.com/share/reel/abcXYZ/")
+    assert sc == "DgMZ0QMTquh"
+    assert "/reel/DgMZ0QMTquh/" in canon
+
+    class _LoginSkipSess:
+        def get(self, url, **kwargs):
+            if "/p/" in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    url="https://www.instagram.com/accounts/login/?next=...",
+                    text="<html>PolarisLoginPage</html>",
+                    cookies={},
+                )
+            return SimpleNamespace(
+                status_code=200,
+                url="https://www.instagram.com/reel/DgMZ0QMTquh/",
+                text='<html>"comments_connection":{"edges":[]}</html>',
+                cookies={"csrftoken": "ok_csrf"},
+            )
+
+        def close(self):
+            pass
+
+    with (
+        patch("stages.s3_collectors.instagram_collector._CURL_AVAILABLE", False),
+        patch("stages.s3_collectors.instagram_collector._create_http_session", return_value=_LoginSkipSess()),
+    ):
+        html, final_u, csrf = _fetch_post_html_sync("https://www.instagram.com/p/DgMZ0QMTquh/", "DgMZ0QMTquh")
+    assert "comments_connection" in html
+    assert "/reel/DgMZ0QMTquh/" in final_u
+    assert csrf == "ok_csrf"

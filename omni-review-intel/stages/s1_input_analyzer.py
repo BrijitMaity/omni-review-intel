@@ -211,25 +211,25 @@ def _extract_ig_headline(raw_title: str, raw_desc: str, uploader: str = "") -> t
 
 
 async def _fetch_ig_metadata_http(url: str) -> dict | None:
-    """Fast Instagram post/reel metadata extraction via curl_cffi HTML meta tags."""
-    from stages.s3_collectors.instagram_collector import _extract_shortcode
+    """Fast Instagram post/reel metadata extraction via curl_cffi HTML meta tags & /embed/captioned/ fallback."""
+    from stages.s3_collectors.instagram_collector import _extract_shortcode, _resolve_share_shortcode_sync
 
     shortcode = _extract_shortcode(url)
+    resolved_url = url
+    if not shortcode:
+        shortcode, resolved_url = await asyncio.to_thread(_resolve_share_shortcode_sync, url)
     if not shortcode:
         return None
 
     def _fetch() -> dict | None:
+        from bs4 import BeautifulSoup
+        from stages.s3_collectors._http_utils import create_chrome_session
+
+        sess = create_chrome_session(timeout=15)
+        if sess is None:
+            return None
         try:
-            from curl_cffi import CurlOpt
-            from curl_cffi import requests as c_requests
-
-            sess = c_requests.Session(impersonate="chrome120", curl_options={CurlOpt.IPRESOLVE: 1})
-            resp = sess.get(f"https://www.instagram.com/p/{shortcode}/", timeout=15)
-            if resp.status_code != 200 or not resp.text:
-                return None
-            html_text = resp.text
-
-            def _meta(attr_name: str, attr_val: str) -> str:
+            def _meta(html_text: str, attr_name: str, attr_val: str) -> str:
                 p1 = re.search(
                     rf'<meta[^>]+{attr_name}=["\']{attr_val}["\'][^>]+content=["\']([^"\']*)["\']',
                     html_text,
@@ -244,22 +244,63 @@ async def _fetch_ig_metadata_http(url: str) -> dict | None:
                 )
                 return p2.group(1) if p2 else ""
 
-            og_title = _meta("property", "og:title")
-            desc = _meta("name", "description") or _meta("property", "og:description")
-            title_tag_m = re.search(r"<title>(.*?)</title>", html_text, re.DOTALL | re.IGNORECASE)
-            title_tag = title_tag_m.group(1) if title_tag_m else ""
+            candidates = []
+            if resolved_url:
+                candidates.append(resolved_url)
+            candidates.extend([
+                f"https://www.instagram.com/reel/{shortcode}/",
+                f"https://www.instagram.com/p/{shortcode}/",
+            ])
+            seen_c: set[str] = set()
+            for cand in candidates:
+                if cand in seen_c:
+                    continue
+                seen_c.add(cand)
+                resp = sess.get(cand)
+                if resp.status_code != 200 or not resp.text:
+                    continue
+                final_u = str(getattr(resp, "url", cand))
+                html_text = resp.text
+                if "/accounts/login" in final_u or "PolarisLoginPage" in html_text:
+                    continue
+                og_title = _meta(html_text, "property", "og:title")
+                desc = _meta(html_text, "name", "description") or _meta(html_text, "property", "og:description")
+                title_tag_m = re.search(r"<title>(.*?)</title>", html_text, re.DOTALL | re.IGNORECASE)
+                title_tag = title_tag_m.group(1) if title_tag_m else ""
+                headline, author = _extract_ig_headline(og_title or title_tag, desc)
+                if headline or desc:
+                    return {
+                        "title": headline or f"Instagram Post ({shortcode})",
+                        "description": desc[:2000],
+                        "tags": [],
+                        "transcript_excerpt": "",
+                        "uploader": author,
+                    }
 
-            headline, author = _extract_ig_headline(og_title or title_tag, desc)
-            if headline or desc:
-                return {
-                    "title": headline or f"Instagram Post ({shortcode})",
-                    "description": desc[:2000],
-                    "tags": [],
-                    "transcript_excerpt": "",
-                    "uploader": author,
-                }
+            # Fallback to /embed/captioned/ when main post page redirects to login wall
+            emb_resp = sess.get(f"https://www.instagram.com/p/{shortcode}/embed/captioned/")
+            if emb_resp.status_code == 200 and emb_resp.text:
+                soup = BeautifulSoup(emb_resp.text, "html.parser")
+                cap_el = soup.select_one(".Caption")
+                usr_el = soup.select_one(".UsernameText, .HeaderText a")
+                cap_txt = cap_el.get_text(" ", strip=True) if cap_el else ""
+                usr_txt = usr_el.get_text(" ", strip=True) if usr_el else ""
+                if cap_txt:
+                    headline, author = _extract_ig_headline("", cap_txt, uploader=usr_txt)
+                    return {
+                        "title": headline or f"Instagram Post ({shortcode})",
+                        "description": cap_txt[:2000],
+                        "tags": [],
+                        "transcript_excerpt": "",
+                        "uploader": author or usr_txt,
+                    }
         except Exception as e:
             logger.debug(f"Instagram HTTP metadata fallback failed for {url}: {e}")
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
         return None
 
     return await asyncio.to_thread(_fetch)
@@ -412,6 +453,9 @@ def _scrape_html_chrome_sync(url: str) -> str:
         )
         if resp.status_code != 200 or not resp.text:
             return ""
+        low_body = resp.text.lower()
+        if "validatecaptcha" in low_body or "enter the characters you see below" in low_body:
+            return ""
         soup = BeautifulSoup(resp.text, "html.parser")
 
         def _meta(attr_name: str, attr_val: str) -> str:
@@ -439,7 +483,17 @@ def _scrape_html_chrome_sync(url: str) -> str:
 
         clean_title = _clean_flipkart_or_ecommerce_title(raw_title)
         # Reject generic soft-error / login placeholder titles
-        if clean_title.lower() in ("sign in", "log in to facebook", "facebook", "amazon.com", "amazon.in", "buy products online at best price in india - all categories"):
+        if clean_title.lower() in (
+            "sign in",
+            "log in to facebook",
+            "facebook",
+            "amazon.com",
+            "amazon.in",
+            "robot check",
+            "sorry! something went wrong!",
+            "just a moment...",
+            "buy products online at best price in india - all categories",
+        ):
             clean_title = ""
 
         for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):

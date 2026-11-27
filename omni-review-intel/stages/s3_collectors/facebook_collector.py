@@ -142,7 +142,9 @@ def _parse_facebook_html_data(html: str, source: DiscoveredSource) -> dict[str, 
 
 
 def _collect_facebook_sync(source: DiscoveredSource) -> dict[str, Any]:
-    cookies = settings.facebook_cookie.strip() if settings.has_facebook_cookie else ""
+    cookies = (settings.facebook_cookie or "").strip().strip('"').strip("'")
+    if cookies.lower().startswith("cookie:"):
+        cookies = cookies.split(":", 1)[1].strip()
     sess = create_chrome_session(cookies=cookies)
     if sess is None:
         return {"comments": [], "total_reported": 0, "login_walled": False}
@@ -154,13 +156,53 @@ def _collect_facebook_sync(source: DiscoveredSource) -> dict[str, Any]:
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
     }
+    best_parsed: dict[str, Any] = {"comments": [], "total_reported": 0, "login_walled": False}
     try:
         resp = sess.get(source.url, headers=headers)
+        final_url = str(getattr(resp, "url", source.url))
         if resp.status_code == 200 and resp.text:
-            parsed = _parse_facebook_html_data(resp.text, source)
-            if "/login" in str(getattr(resp, "url", "")):
-                parsed["login_walled"] = True
-            return parsed
+            best_parsed = _parse_facebook_html_data(resp.text, source)
+            if "/login" in final_url:
+                best_parsed["login_walled"] = True
+            if best_parsed["comments"]:
+                return best_parsed
+
+        # Try alternate TLS impersonations and mobile/www forms if blocked or empty
+        try:
+            from curl_cffi import requests as c_requests
+        except ImportError:
+            c_requests = None
+        if c_requests is not None and not best_parsed["comments"]:
+            cand_urls = [final_url]
+            if "www.facebook.com" in final_url:
+                cand_urls.append(final_url.replace("www.facebook.com", "m.facebook.com", 1))
+            for imp in ("safari17_0", "chrome124"):
+                if best_parsed["comments"]:
+                    break
+                alt = None
+                try:
+                    alt = c_requests.Session(impersonate=imp)
+                    if cookies:
+                        alt.headers.update({"Cookie": cookies})
+                    for cu in cand_urls:
+                        ar = alt.get(cu, headers=headers, timeout=15)
+                        if ar.status_code == 200 and ar.text:
+                            cur = _parse_facebook_html_data(ar.text, source)
+                            if "/login" in str(getattr(ar, "url", cu)):
+                                cur["login_walled"] = True
+                            if cur["comments"]:
+                                return cur
+                            best_parsed["total_reported"] = max(best_parsed["total_reported"], cur["total_reported"])
+                            best_parsed["login_walled"] = best_parsed["login_walled"] or cur["login_walled"]
+                except Exception:
+                    pass
+                finally:
+                    if alt is not None:
+                        try:
+                            alt.close()
+                        except Exception:
+                            pass
+        return best_parsed
     except Exception as e:
         logger.debug(f"Facebook HTML fetch failed for {source.url}: {e}")
     finally:
@@ -211,7 +253,7 @@ async def collect_facebook(source: DiscoveredSource) -> tuple[list[RawComment], 
     fb_id = _extract_facebook_id(source.url)
     max_items: int | None = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
     auth_mode = 1 if settings.has_facebook_cookie else 0
-    cache_id = f"fb_v1::{fb_id or source.url}::{auth_mode}::{settings.max_comments_per_url}"
+    cache_id = f"fb_v2::{fb_id or source.url}::{auth_mode}::{settings.max_comments_per_url}"
 
     cache = get_cache()
     cached = cache.get("s3_facebook", cache_id)

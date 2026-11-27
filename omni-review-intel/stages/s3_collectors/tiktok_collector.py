@@ -102,24 +102,55 @@ def _collect_tiktok_sync(
         final_url = str(getattr(resp, "url", source.url))
         vid = video_id or _extract_tiktok_video_id(final_url)
 
-        if resp.status_code == 200 and resp.text:
+        def _extract_rehyd(html_body: str) -> bool:
+            nonlocal vid, total_reported
             m_rehyd = re.search(
                 r'<script[^>]+id=["\']__UNIVERSAL_DATA_FOR_REHYDRATION__["\'][^>]*>(.*?)</script>',
-                resp.text,
+                html_body or "",
                 re.DOTALL,
             )
-            if m_rehyd:
-                try:
-                    data = json.loads(m_rehyd.group(1))
-                    if not vid:
-                        m_vid = re.search(r'"id":"(\d{15,22})"', m_rehyd.group(1))
-                        if m_vid:
-                            vid = m_vid.group(1)
-                    m_cnt = re.search(r'"commentCount":(\d+)', m_rehyd.group(1))
-                    if m_cnt:
-                        total_reported = max(total_reported, int(m_cnt.group(1)))
-                except Exception:
-                    pass
+            if not m_rehyd:
+                return False
+            try:
+                json.loads(m_rehyd.group(1))
+                if not vid:
+                    m_vid = re.search(r'"id":"(\d{15,22})"', m_rehyd.group(1))
+                    if m_vid:
+                        vid = m_vid.group(1)
+                m_cnt = re.search(r'"commentCount":(\d+)', m_rehyd.group(1))
+                if m_cnt:
+                    total_reported = max(total_reported, int(m_cnt.group(1)))
+                return True
+            except Exception:
+                return False
+
+        has_rehyd = resp.status_code == 200 and _extract_rehyd(resp.text or "")
+        if not has_rehyd:
+            try:
+                from curl_cffi import requests as c_requests
+            except ImportError:
+                c_requests = None
+            if c_requests is not None:
+                for imp in ("chrome124", "safari17_0", "edge101"):
+                    alt = None
+                    try:
+                        alt = c_requests.Session(impersonate=imp)
+                        ar = alt.get(final_url, headers=headers, timeout=15)
+                        if ar.status_code == 200 and _extract_rehyd(ar.text or ""):
+                            sess.close()
+                            sess = alt
+                            alt = None
+                            final_url = str(getattr(ar, "url", final_url))
+                            vid = vid or _extract_tiktok_video_id(final_url)
+                            break
+                    except Exception:
+                        pass
+                    finally:
+                        if alt is not None:
+                            try:
+                                alt.close()
+                            except Exception:
+                                pass
 
         if vid:
             cursor = 0
@@ -207,7 +238,7 @@ async def collect_tiktok(source: DiscoveredSource) -> tuple[list[RawComment], Di
     video_id = _extract_tiktok_video_id(source.url)
     max_items: int | None = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
     auth_mode = 1 if settings.has_apify else 0
-    cache_id = f"tt_v2::{video_id or source.url}::{auth_mode}::{settings.max_comments_per_url}"
+    cache_id = f"tt_v3::{video_id or source.url}::{auth_mode}::{settings.max_comments_per_url}"
 
     cache = get_cache()
     cached = cache.get("s3_tiktok", cache_id)

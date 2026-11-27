@@ -52,7 +52,7 @@ except ImportError:
 
 
 _IG_SHORTCODE_RE = re.compile(
-    r"(?:instagram\.com|instagr\.am)/(?:[A-Za-z0-9_.]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]{5,})",
+    r"(?:instagram\.com|instagr\.am)/(?!share/)(?:[A-Za-z0-9_.]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]{5,})",
     re.IGNORECASE,
 )
 _SCRIPT_JSON_RE = re.compile(
@@ -73,29 +73,93 @@ _BROWSER_HEADERS = {
 
 
 def _extract_shortcode(url: str) -> str | None:
-    """Extract the Instagram media shortcode from /p/, /reel/, /reels/, or /tv/ URLs."""
+    """Extract the Instagram media shortcode from /p/, /reel/, /reels/, or /tv/ URLs (excluding /share/ links)."""
     if not url:
         return None
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     if host and "instagram.com" not in host and "instagr.am" not in host:
         return None
+    if parsed.path.lower().startswith("/share/"):
+        return None
     match = _IG_SHORTCODE_RE.search(url)
     return match.group(1) if match else None
 
 
+_IG_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _shortcode_to_media_id(shortcode: str) -> str | None:
+    """Convert an Instagram base64 shortcode (first 11 chars) to its numeric media_id."""
+    if not shortcode or len(shortcode) < 5:
+        return None
+    core = shortcode[:11]
+    if any(ch not in _IG_B64_ALPHABET for ch in core):
+        return None
+    val = 0
+    for ch in core:
+        val = val * 64 + _IG_B64_ALPHABET.index(ch)
+    return str(val) if val > 0 else None
+
+
+def _resolve_share_shortcode_sync(url: str) -> tuple[str | None, str]:
+    """Resolve Instagram /share/... or instagr.am shortlinks to their canonical shortcode & URL."""
+    sc = _extract_shortcode(url)
+    if sc:
+        return sc, url
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if "instagram.com" not in host and "instagr.am" not in host:
+        return None, url
+    client = _create_http_session()
+    if client is None:
+        return None, url
+    try:
+        resp = client.get(url, headers=_BROWSER_HEADERS)
+        final_url = str(getattr(resp, "url", url))
+        sc = _extract_shortcode(final_url)
+        if not sc and getattr(resp, "text", ""):
+            m_can = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']', resp.text, re.I)
+            if m_can:
+                sc = _extract_shortcode(m_can.group(1))
+                if sc:
+                    final_url = m_can.group(1)
+        return sc, final_url
+    except Exception:
+        return None, url
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _parse_ig_cookie_dict(raw: str) -> dict[str, str]:
+    """Parse raw sessionid token or full Cookie header string into a clean cookie dict."""
+    text = (raw or "").strip().strip('"').strip("'")
+    if text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+    if not text:
+        return {}
+    cookies: dict[str, str] = {}
+    if "=" in text and (";" in text or "sessionid=" in text.lower()):
+        for part in text.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and v:
+                    cookies[k] = v
+    else:
+        cookies["sessionid"] = text
+    return cookies
+
+
 def _normalize_session_id(raw: str) -> str:
     """Normalize raw cookie value or full 'sessionid=...' header snippet."""
-    value = (raw or "").strip().strip('"').strip("'")
-    if not value:
-        return ""
-    if "sessionid=" in value:
-        for part in value.split(";"):
-            part = part.strip()
-            if part.startswith("sessionid="):
-                value = part.split("=", 1)[1].strip()
-                break
-    return value
+    parsed = _parse_ig_cookie_dict(raw)
+    return parsed.get("sessionid", "")
 
 
 def _format_ig_timestamp(ts: Any) -> str:
@@ -409,37 +473,61 @@ def _fetch_post_html_sync(
     shortcode: str | None,
     session_id: str = "",
 ) -> tuple[str, str, str]:
-    """Fetch Instagram post/reel HTML synchronously and return (html, final_url, csrftoken)."""
-    cookies = {"sessionid": session_id} if session_id else None
-    client = _create_http_session(cookies=cookies)
-    if client is None:
-        return "", url, ""
+    """Fetch Instagram post/reel HTML synchronously across URL forms and TLS profiles without stopping early on login gates."""
+    cookies = _parse_ig_cookie_dict(session_id) if session_id else None
 
     candidate_urls: list[str] = []
-    if shortcode:
-        candidate_urls.append(f"https://www.instagram.com/p/{shortcode}/")
-        candidate_urls.append(f"https://www.instagram.com/reel/{shortcode}/")
-    if url not in candidate_urls:
+    if url:
         candidate_urls.append(url)
+    if shortcode:
+        if f"/reel/{shortcode}" not in url:
+            candidate_urls.append(f"https://www.instagram.com/reel/{shortcode}/")
+        if f"/p/{shortcode}" not in url:
+            candidate_urls.append(f"https://www.instagram.com/p/{shortcode}/")
 
-    try:
-        for target_url in candidate_urls:
-            resp = client.get(target_url, headers=_BROWSER_HEADERS)
-            if resp.status_code == 200 and resp.text:
-                csrf = ""
-                try:
-                    csrf = resp.cookies.get("csrftoken") or client.cookies.get("csrftoken") or ""
-                except Exception:
-                    csrf = ""
-                return resp.text, str(getattr(resp, "url", target_url)), csrf
-    except Exception as e:
-        logger.debug(f"Instagram HTML fetch failed for {url}: {e}")
-    finally:
+    def _is_login_gate(resp_obj: Any) -> bool:
+        final_u = str(getattr(resp_obj, "url", ""))
+        txt = str(getattr(resp_obj, "text", "") or "")
+        if "/accounts/login" in final_u or "PolarisLoginPage" in txt or "__coig_login" in txt:
+            return "comments_connection" not in txt and "edge_media_to" not in txt
+        return False
+
+    fallback_tuple: tuple[str, str, str] = ("", url, "")
+    impersonations = ["chrome124", "safari17_0", "chrome120"]
+
+    for idx_imp, imp in enumerate(impersonations):
+        client = None
+        if _CURL_AVAILABLE and idx_imp > 0:
+            try:
+                client = curl_requests.Session(impersonate=imp, cookies=cookies or {})
+            except Exception:
+                client = None
+        if client is None:
+            client = _create_http_session(cookies=cookies)
+        if client is None:
+            continue
         try:
-            client.close()
-        except Exception:
-            pass
-    return "", url, ""
+            for target_url in candidate_urls:
+                resp = client.get(target_url, headers=_BROWSER_HEADERS)
+                if resp.status_code == 200 and resp.text:
+                    csrf = ""
+                    try:
+                        csrf = resp.cookies.get("csrftoken") or client.cookies.get("csrftoken") or ""
+                    except Exception:
+                        csrf = ""
+                    cur_tuple = (resp.text, str(getattr(resp, "url", target_url)), csrf)
+                    if not fallback_tuple[0]:
+                        fallback_tuple = cur_tuple
+                    if not _is_login_gate(resp):
+                        return cur_tuple
+        except Exception as e:
+            logger.debug(f"Instagram HTML fetch ({imp}) failed for {url}: {e}")
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return fallback_tuple
 
 
 def _collect_via_session_api_sync(
@@ -449,10 +537,13 @@ def _collect_via_session_api_sync(
     max_items: int | None,
 ) -> dict[str, Any]:
     """
-    Use user's `sessionid` cookie to paginate Instagram's `/api/v1/media/{media_id}/comments/`
-    and child comment threads up to `max_items` (or all if `max_items is None`).
+    Use user's `sessionid` cookie (plus optional csrftoken/ds_user_id) to paginate
+    Instagram's `/api/v1/media/{media_id}/comments/` and child threads.
     """
-    cookies = {"sessionid": session_id}
+    cookies = _parse_ig_cookie_dict(session_id)
+    if not cookies.get("sessionid"):
+        return {"comments": [], "total_reported": 0, "session_rejected": False}
+
     client = _create_http_session(cookies=cookies)
     if client is None:
         return {"comments": [], "total_reported": 0, "session_rejected": False}
@@ -462,15 +553,15 @@ def _collect_via_session_api_sync(
     total_reported = 0
     session_rejected = False
     media_id: str | None = None
-    csrf_token = ""
+    csrf_token = cookies.get("csrftoken", "")
 
     try:
-        post_url = f"https://www.instagram.com/p/{shortcode}/"
+        post_url = source.url if f"/{shortcode}" in source.url else f"https://www.instagram.com/p/{shortcode}/"
         html_resp = client.get(post_url, headers=_BROWSER_HEADERS)
         try:
-            csrf_token = html_resp.cookies.get("csrftoken") or client.cookies.get("csrftoken") or ""
+            csrf_token = html_resp.cookies.get("csrftoken") or client.cookies.get("csrftoken") or csrf_token
         except Exception:
-            csrf_token = ""
+            pass
 
         if html_resp.status_code == 200 and html_resp.text:
             parsed = _parse_public_html_data(html_resp.text, shortcode, source)
@@ -488,6 +579,9 @@ def _collect_via_session_api_sync(
                     seen_keys.add(f"pk:{c.comment_id.rsplit('_', 1)[-1]}")
                     comments.append(c)
 
+        # Mathematical shortcode -> media_id fallback so authenticated API still runs if HTML omitted media_id
+        if not media_id:
+            media_id = _shortcode_to_media_id(shortcode)
         if not media_id:
             return {
                 "comments": comments,
@@ -675,9 +769,13 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
     using optional Apify or user `INSTAGRAM_SESSION_ID` cookie for full pagination.
     """
     shortcode = _extract_shortcode(source.url)
+    resolved_url = source.url
+    if not shortcode:
+        shortcode, resolved_url = await asyncio.to_thread(_resolve_share_shortcode_sync, source.url)
+
     max_items: int | None = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
     auth_mode = 2 if settings.has_apify else (1 if settings.has_instagram_session else 0)
-    cache_id = f"ig_v3::{shortcode or source.url}::{auth_mode}::{settings.max_comments_per_url}"
+    cache_id = f"ig_v4::{shortcode or source.url}::{auth_mode}::{settings.max_comments_per_url}"
 
     cache = get_cache()
     cached = cache.get("s3_instagram", cache_id)
@@ -741,7 +839,7 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
     session_id = _normalize_session_id(settings.instagram_session_id)
     if session_id:
         res = await asyncio.to_thread(
-            _collect_via_session_api_sync, source, shortcode, session_id, max_items
+            _collect_via_session_api_sync, source, shortcode, settings.instagram_session_id, max_items
         )
         comments = res["comments"]
         total_reported = res["total_reported"]
@@ -751,7 +849,7 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
     # Layer 3: Zero-key public HTML embedded JSON extraction
     if not comments:
         html, _final_url, _csrf = await asyncio.to_thread(
-            _fetch_post_html_sync, source.url, shortcode, ""
+            _fetch_post_html_sync, resolved_url, shortcode, ""
         )
         if html:
             parsed = _parse_public_html_data(html, shortcode, source)
@@ -763,7 +861,7 @@ async def collect_instagram(source: DiscoveredSource) -> tuple[list[RawComment],
     # Layer 4: yt-dlp fallback for reels/videos
     if not comments:
         yt_comments = await asyncio.to_thread(
-            _collect_via_ytdlp_ig_sync, source.url, shortcode, source, max_items
+            _collect_via_ytdlp_ig_sync, resolved_url, shortcode, source, max_items
         )
         if yt_comments:
             comments = yt_comments
