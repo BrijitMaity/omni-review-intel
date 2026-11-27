@@ -215,19 +215,20 @@ async def _analyze_batch(
     """Send one batch to the LLM Map phase and return AnalyzedComment list.
     Results are cached by sorted comment IDs to avoid duplicate LLM calls on retry.
     """
-    cache = get_cache()
-    # Cache key: sorted IDs for order-independence
-    batch_key = "|".join(sorted(c.comment_id for c in batch))
     target_map = {c.comment_id: c.is_target for c in batch}
-    cached = cache.get("s4_batch", batch_key)
-    if cached:
-        analyzed = [AnalyzedComment.model_validate(x) for x in cached.get("comments", [])]
+
+    if not llm:
+        analyzed = [_heuristic_analyze_comment(c, topic_name) for c in batch]
         for a in analyzed:
             a.is_target = target_map.get(a.comment_id, getattr(a, "is_target", False))
         return analyzed
 
-    if not llm:
-        analyzed = [_heuristic_analyze_comment(c, topic_name) for c in batch]
+    cache = get_cache()
+    # Cache key: sorted IDs for order-independence
+    batch_key = "|".join(sorted(c.comment_id for c in batch))
+    cached = cache.get("s4_batch", batch_key)
+    if cached:
+        analyzed = [AnalyzedComment.model_validate(x) for x in cached.get("comments", [])]
         for a in analyzed:
             a.is_target = target_map.get(a.comment_id, getattr(a, "is_target", False))
         return analyzed
@@ -315,6 +316,8 @@ async def map_analyze(
         async with sem:
             result = await _analyze_batch(batch, topic.canonical_name, prompt_path, llm)
             step = 15 if llm is None else 5
+            if llm is None and (idx + 1) % 25 == 0:
+                await asyncio.sleep(0)
             if progress_cb and (idx == 0 or (idx + 1) % step == 0 or (idx + 1) == total_batches):
                 await progress_cb(
                     "Stage 4 Map",

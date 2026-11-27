@@ -161,3 +161,79 @@ def test_router_instagram_not_skipped_to_apify():
     assert len(res_comments) == 1
     assert res_src.scrape_status == "partial"
     assert res_src.collector_used == "instagram_public_html"
+
+
+def test_effective_max_comments_and_router_cancel_timeout(monkeypatch):
+    import asyncio
+    import threading
+    import config
+    from stages.s3_collectors.router import _collect_one
+
+    orig = config.settings.max_comments_per_url
+    try:
+        config.settings.max_comments_per_url = 0
+        monkeypatch.setattr(config, "get_container_memory_limit_mb", lambda: None)
+        assert config.effective_max_comments(is_target=True) == 0
+        assert config.effective_max_comments(is_target=False) == 1500
+
+        monkeypatch.setattr(config, "get_container_memory_limit_mb", lambda: 1024.0)
+        assert config.effective_max_comments(is_target=True) == 12000
+        assert config.effective_max_comments(is_target=False) == 1000
+    finally:
+        config.settings.max_comments_per_url = orig
+
+    ev = threading.Event()
+    ev.set()
+    src = DiscoveredSource(url="https://youtube.com/watch?v=test", platform="YouTube", is_target=True)
+    with config.scoped_cancel_event(ev):
+        c_list, out_src = asyncio.run(_collect_one(src, asyncio.Semaphore(1)))
+    assert c_list == []
+    assert out_src.scrape_status == "skipped"
+    assert "cancelled" in out_src.error_message.lower()
+
+
+def test_youtube_tok_key_deduplicates_compactly():
+    from stages.s3_collectors.youtube_collector import _extract_innertube_page, _tok_key
+
+    visited = set()
+    replies = set()
+    payload = {
+        "onResponseReceivedEndpoints": [
+            {
+                "appendContinuationItemsAction": {
+                    "continuationItems": [
+                        {
+                            "continuationItemRenderer": {
+                                "continuationEndpoint": {"continuationCommand": {"token": "tok_next_123"}}
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    _, _, nxt1, _ = _extract_innertube_page(
+        data=payload,
+        video_id="k_mx4THsQik",
+        source_url="https://youtube.com/watch?v=k_mx4THsQik",
+        is_target=True,
+        seen_ids=set(),
+        max_items=100,
+        current_count=0,
+        visited_tokens=visited,
+        seen_reply_tokens=replies,
+    )
+    assert nxt1 == "tok_next_123"
+    visited.add(_tok_key("tok_next_123"))
+    _, _, nxt2, _ = _extract_innertube_page(
+        data=payload,
+        video_id="k_mx4THsQik",
+        source_url="https://youtube.com/watch?v=k_mx4THsQik",
+        is_target=True,
+        seen_ids=set(),
+        max_items=100,
+        current_count=0,
+        visited_tokens=visited,
+        seen_reply_tokens=replies,
+    )
+    assert nxt2 is None

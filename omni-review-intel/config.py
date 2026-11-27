@@ -5,6 +5,8 @@ All pipeline tuning parameters live here; nothing is hardcoded elsewhere.
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
+import threading
 from typing import Any, Iterator, Optional
 
 from pydantic import Field
@@ -12,6 +14,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _scoped_overrides: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "omni_scoped_settings_overrides", default=None
+)
+_cancel_event_var: ContextVar[Optional[threading.Event]] = ContextVar(
+    "omni_run_cancel_event", default=None
 )
 
 _BYPASS_SCOPED_ATTRS = frozenset({
@@ -162,3 +167,59 @@ def scoped_settings(**overrides: Any) -> Iterator[None]:
         yield
     finally:
         _scoped_overrides.reset(token)
+
+
+@contextmanager
+def scoped_cancel_event(ev: Optional[threading.Event]) -> Iterator[None]:
+    """Bind a cooperative cancellation Event to the current thread/async context."""
+    token = _cancel_event_var.set(ev)
+    try:
+        yield
+    finally:
+        _cancel_event_var.reset(token)
+
+
+def get_cancel_event() -> Optional[threading.Event]:
+    """Return the active cooperative cancellation Event if present."""
+    return _cancel_event_var.get()
+
+
+def is_run_cancelled() -> bool:
+    """Return True if the active pipeline run has been cancelled."""
+    ev = _cancel_event_var.get()
+    return bool(ev is not None and ev.is_set())
+
+
+def get_container_memory_limit_mb() -> Optional[float]:
+    """Return Linux cgroup memory limit in MiB when running in a memory-bounded container."""
+    for cg_path in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            if not cg_path.is_file():
+                continue
+            raw = cg_path.read_text(encoding="utf-8").strip()
+            if not raw or raw == "max":
+                continue
+            limit_bytes = int(raw)
+            # Ignore effectively unlimited host values (>= 128 GiB)
+            if 0 < limit_bytes < 128 * (1024**3):
+                return limit_bytes / (1024.0 * 1024.0)
+        except Exception:
+            continue
+    return None
+
+
+def effective_max_comments(is_target: bool = True) -> int:
+    """Return per-source comment limit respecting uncapped mode and container RAM ceilings."""
+    requested = int(settings.max_comments_per_url or 0)
+    limit_mb = get_container_memory_limit_mb()
+    if limit_mb is not None and limit_mb <= 2048.0:
+        safe_target = 12_000 if limit_mb <= 1300.0 else 25_000
+        safe_secondary = 1_000
+        cap = safe_target if is_target else safe_secondary
+        return cap if requested <= 0 else min(requested, cap)
+    if requested <= 0:
+        return 0 if is_target else 1_500
+    return requested

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from loguru import logger
 
-from config import settings
+from config import is_run_cancelled, settings
 from core.schemas import DiscoveredSource, RawComment
 
 from stages.s3_collectors.youtube_collector import collect_youtube
@@ -41,26 +41,36 @@ async def _collect_one(
 ) -> tuple[list[RawComment], DiscoveredSource]:
     """Route one source to its collector, return (comments, updated_source)."""
     async with sem:
+        if is_run_cancelled():
+            source.scrape_status = "skipped"
+            source.error_message = "Run cancelled"
+            return [], source
         try:
             platform = source.platform
             if platform in _YT_PLATFORMS:
-                comments, source = await collect_youtube(source)
+                coro = collect_youtube(source)
             elif platform in _REDDIT_PLATFORMS:
-                comments, source = await collect_reddit(source)
+                coro = collect_reddit(source)
             elif platform in _IG_PLATFORMS:
-                comments, source = await collect_instagram(source)
+                coro = collect_instagram(source)
             elif platform in _AMAZON_PLATFORMS:
-                comments, source = await collect_amazon(source)
+                coro = collect_amazon(source)
             elif platform in _FLIPKART_PLATFORMS:
-                comments, source = await collect_flipkart(source)
+                coro = collect_flipkart(source)
             elif platform in _FB_PLATFORMS:
-                comments, source = await collect_facebook(source)
+                coro = collect_facebook(source)
             elif platform in _TIKTOK_PLATFORMS:
-                comments, source = await collect_tiktok(source)
+                coro = collect_tiktok(source)
             elif platform in _APIFY_PLATFORMS:
-                comments, source = await collect_apify(source)
+                coro = collect_apify(source)
             else:
-                comments, source = await collect_web(source)
+                coro = collect_web(source)
+            comments, source = await asyncio.wait_for(coro, timeout=180.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Collector timed out after 180s for {source.url}")
+            source.scrape_status = "partial"
+            source.error_message = "Collector timed out after 180s"
+            comments = []
         except Exception as e:
             logger.error(f"Collector crashed for {source.url}: {e}")
             source.scrape_status = "failed"

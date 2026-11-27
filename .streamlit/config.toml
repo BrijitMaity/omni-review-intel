@@ -8,6 +8,8 @@ font = "sans serif"
 
 [server]
 headless = true
+websocketPingInterval = 25
+disconnectedSessionTTL = 300
 
 [browser]
 gatherUsageStats = false

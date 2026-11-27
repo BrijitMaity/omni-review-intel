@@ -151,6 +151,10 @@ async def run_pipeline(
         state.analyzed_comments = analyzed
         state.executive_review = executive
         state.total_comments_valid = len(analyzed)
+        if len(state.raw_comments) > 2000:
+            import gc
+            state.raw_comments = []
+            gc.collect()
 
         # Compute overall sentiment percentages for UI display
         if valid_comments:

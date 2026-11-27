@@ -28,6 +28,20 @@ from pathlib import Path
 from typing import Any, Optional
 
 import streamlit as st
+
+_ACTIVE_RUN_LOCK = threading.Lock()
+_ACTIVE_CANCEL_EVENT: list[Optional[threading.Event]] = [None]
+
+
+def _rotate_cancel_event(create_new: bool = True) -> Optional[threading.Event]:
+    """Cancel any lingering background pipeline run and optionally return a fresh cancel Event."""
+    with _ACTIVE_RUN_LOCK:
+        prev = _ACTIVE_CANCEL_EVENT[0]
+        if prev is not None:
+            prev.set()
+        new_ev = threading.Event() if create_new else None
+        _ACTIVE_CANCEL_EVENT[0] = new_ev
+        return new_ev
 from core.url_safety import is_safe_public_url as _is_safe_public_url
 from core.ui_theme import (
     VIBRANT_SERIES_COLORS,
@@ -294,6 +308,7 @@ def _run_pipeline_sync(
     out_dir: str,
     progress_queue,
     overrides: Optional[dict[str, Any]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """Run the async pipeline in a fresh event loop inside a thread with session-scoped settings.
     Returns a dict with state data or {'error': str}.
@@ -311,12 +326,12 @@ def _run_pipeline_sync(
         )
 
     try:
-        from config import scoped_settings
+        from config import scoped_cancel_event, scoped_settings
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            with scoped_settings(**(overrides or {})):
+            with scoped_cancel_event(cancel_event), scoped_settings(**(overrides or {})):
                 state = loop.run_until_complete(_inner())
         finally:
             loop.close()
@@ -358,6 +373,7 @@ with st.form("run_form", clear_on_submit=False):
 col_spacer, col_clear = st.columns([5, 1])
 with col_clear:
     if st.button("🔄 Clear / Reset", use_container_width=True):
+        _rotate_cancel_event(create_new=False)
         st.session_state.analysis_state = None
         st.session_state.multi_analysis_states = []
         st.rerun()
@@ -427,6 +443,7 @@ if submitted:
         collected_states = []
 
         total_urls = len(urls_to_process)
+        run_cancel_event = _rotate_cancel_event(create_new=True)
         for u_idx, target_url in enumerate(urls_to_process, start=1):
             progress_queue: queue_mod.Queue = queue_mod.Queue()
             log_lines: list[str] = []
@@ -434,8 +451,18 @@ if submitted:
 
             url_prefix = f"Target [{u_idx}/{total_urls}]" if total_urls > 1 else "Pipeline"
 
-            def _thread_worker(cur_url=target_url, cur_overrides=dict(session_overrides)):
-                res = _run_pipeline_sync(cur_url, output_dir, progress_queue, overrides=cur_overrides)
+            def _thread_worker(
+                cur_url=target_url,
+                cur_overrides=dict(session_overrides),
+                cur_cancel=run_cancel_event,
+            ):
+                res = _run_pipeline_sync(
+                    cur_url,
+                    output_dir,
+                    progress_queue,
+                    overrides=cur_overrides,
+                    cancel_event=cur_cancel,
+                )
                 result_container.append(res)
                 progress_queue.put_nowait(("__DONE__", ""))
 
@@ -829,9 +856,17 @@ if st.session_state.analysis_state is not None:
             sq = search_query.strip().lower()
             filtered = [c for c in filtered if sq in c.english_text.lower() or sq in c.aspect_tag.lower()]
 
-        st.caption(f"Showing all {len(filtered):,} matching comments (fully exported in Excel as well)")
+        _MAX_UI_TABLE_ROWS = 25000
+        display_rows = filtered[:_MAX_UI_TABLE_ROWS]
+        if len(filtered) > _MAX_UI_TABLE_ROWS:
+            st.caption(
+                f"Showing first {_MAX_UI_TABLE_ROWS:,} of {len(filtered):,} matching comments in browser table "
+                f"(all {len(filtered):,} comments are exported in the Excel report)"
+            )
+        else:
+            st.caption(f"Showing all {len(filtered):,} matching comments (fully exported in Excel as well)")
 
-        if filtered:
+        if display_rows:
             comments_df = pd.DataFrame(
                 [
                     {
@@ -845,7 +880,7 @@ if st.session_state.analysis_state is not None:
                         "Confidence": f"{c.confidence_score:.2f}",
                         "Comment":    (c.original_text or c.english_text or "")[:1000],
                     }
-                    for idx, c in enumerate(filtered, start=1)
+                    for idx, c in enumerate(display_rows, start=1)
                 ]
             )
 

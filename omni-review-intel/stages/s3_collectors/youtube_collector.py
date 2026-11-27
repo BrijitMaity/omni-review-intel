@@ -7,11 +7,18 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import hashlib
+import time
 from typing import Any
 
 from loguru import logger
 
-from config import settings
+from config import (
+    effective_max_comments,
+    get_cancel_event,
+    get_container_memory_limit_mb,
+    settings,
+)
 from core.schemas import DiscoveredSource, RawComment
 from core.cache import get_cache
 
@@ -20,6 +27,11 @@ import re
 _YT_ID_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?.*v=|shorts/|embed/|live/|v/)|youtu\.be/)([a-zA-Z0-9_-]{11})"
 )
+
+
+def _tok_key(token: str) -> bytes:
+    """Compact 12-byte digest for large continuation-token sets (saves ~95% RAM)."""
+    return hashlib.blake2b(token.encode("utf-8", errors="ignore"), digest_size=12).digest()
 
 
 def _extract_video_id(url: str) -> str | None:
@@ -83,7 +95,7 @@ async def collect_youtube(
         source.error_message = "Could not extract YouTube video ID"
         return [], source
 
-    req_max = settings.max_comments_per_url
+    req_max = effective_max_comments(is_target=source.is_target)
     max_items: int | None = req_max if req_max > 0 else None
 
     cache = get_cache()
@@ -177,16 +189,17 @@ async def collect_youtube(
             source.scrape_status = "success"
             source.error_message = ""
         source.comments_collected = len(comments)
-        cache.set(
-            "s3_youtube",
-            cache_key,
-            {
-                "comments": [c.model_dump() for c in comments],
-                "expected_total": est_total,
-                "scrape_status": source.scrape_status,
-                "collector_used": source.collector_used,
-            },
-        )
+        if len(comments) <= 25000:
+            cache.set(
+                "s3_youtube",
+                cache_key,
+                {
+                    "comments": [c.model_dump() for c in comments],
+                    "expected_total": est_total,
+                    "scrape_status": source.scrape_status,
+                    "collector_used": source.collector_used,
+                },
+            )
     return comments, source
 
 
@@ -412,8 +425,9 @@ def _extract_innertube_page(
                         rtok = cc.get("token") if isinstance(cc, dict) else None
                         if rtok:
                             r_decoded = urllib.parse.unquote(rtok)
-                            if r_decoded not in seen_reply_tokens:
-                                seen_reply_tokens.add(r_decoded)
+                            r_key = _tok_key(r_decoded)
+                            if r_key not in seen_reply_tokens and r_decoded not in seen_reply_tokens:
+                                seen_reply_tokens.add(r_key)
                                 new_reply_tokens.append(r_decoded)
             elif it.get("commentRenderer"):
                 _parse_comment_renderer(it["commentRenderer"])
@@ -440,7 +454,8 @@ def _extract_innertube_page(
                             break
                 if tok:
                     decoded = urllib.parse.unquote(tok)
-                    if decoded not in visited_tokens:
+                    d_key = _tok_key(decoded)
+                    if d_key not in visited_tokens and decoded not in visited_tokens:
                         next_token = decoded
 
     return page_comments, raw_in_page, next_token, new_reply_tokens
@@ -459,8 +474,9 @@ async def _collect_via_innertube_curl(
     """
     import json
     import re
-    import time
     import urllib.parse
+
+    cancel_ev = get_cancel_event()
 
     try:
         from curl_cffi import CurlOpt, requests as c_requests
@@ -710,11 +726,18 @@ async def _collect_via_innertube_curl(
         if meta_out is not None and est_total:
             meta_out["est_total"] = est_total
 
-        max_items = settings.max_comments_per_url if settings.max_comments_per_url > 0 else 1_000_000
+        req_max = effective_max_comments(is_target=source.is_target)
+        max_items = req_max if req_max > 0 else 1_000_000
+        started_at = time.monotonic()
+        container_mb = get_container_memory_limit_mb()
+        is_constrained = bool(container_mb is not None and container_mb <= 2048.0)
+        max_pagination_secs = 90.0 if is_constrained else 180.0
+        max_phase3_secs = 35.0 if is_constrained else 60.0
+
         comments: list[RawComment] = []
         seen_ids: set[str] = set()
-        visited_tokens: set[str] = set()
-        seen_reply_tokens: set[str] = set()
+        visited_tokens: set[bytes | str] = set()
+        seen_reply_tokens: set[bytes | str] = set()
         reply_queue: list[str] = []
 
         post_url = (
@@ -723,14 +746,30 @@ async def _collect_via_innertube_curl(
             else "https://www.youtube.com/youtubei/v1/next"
         )
         MAX_CONSECUTIVE_EMPTY = 3
-        MAX_RETRIES_PER_PAGE = max(6, len(profiles) + 1)
+        MAX_RETRIES_PER_PAGE = max(5, len(profiles) + 1)
         total_requests = 0
 
-        def _post_with_session(sess: Any, prof_idx: int, tok: str) -> tuple[dict | None, Any, int]:
+        def _cancelled() -> bool:
+            return bool(cancel_ev is not None and cancel_ev.is_set())
+
+        def _post_with_session(
+            sess: Any,
+            prof_idx: int,
+            tok: str,
+            *,
+            max_attempts: int | None = None,
+            req_timeout: int = 25,
+            update_shared_state: bool = True,
+            fixed_visitor: str = "",
+        ) -> tuple[dict | None, Any, int]:
             nonlocal total_requests, last_error_note, visitor_data
-            total_requests += 1
-            for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
-                cur_vis = visitor_data
+            attempts = max_attempts or MAX_RETRIES_PER_PAGE
+            if update_shared_state:
+                total_requests += 1
+            for attempt in range(1, attempts + 1):
+                if _cancelled():
+                    return None, sess, prof_idx
+                cur_vis = visitor_data if update_shared_state else fixed_visitor
                 client_obj: dict[str, Any] = {
                     "hl": "en",
                     "gl": "US",
@@ -753,32 +792,37 @@ async def _collect_via_innertube_curl(
                     yt_headers["X-Goog-Visitor-Id"] = cur_vis
                 try:
                     try:
-                        resp = sess.post(post_url, json=payload, headers=yt_headers, timeout=25)
+                        resp = sess.post(post_url, json=payload, headers=yt_headers, timeout=req_timeout)
                     except TypeError:
                         # Compatible with simplified test mock signatures lacking headers kwarg
-                        resp = sess.post(post_url, json=payload, timeout=25)
+                        resp = sess.post(post_url, json=payload, timeout=req_timeout)
                     if resp.status_code == 200:
                         cand = resp.json()
                         if isinstance(cand, dict):
-                            vd = (cand.get("responseContext") or {}).get("visitorData")
-                            if vd:
-                                visitor_data = str(vd)
+                            if update_shared_state:
+                                vd = (cand.get("responseContext") or {}).get("visitorData")
+                                if vd:
+                                    visitor_data = str(vd)
                             # YouTube sometimes sends incomplete 200 JSON (responseContext-only) mid-stream; retry it!
                             if "onResponseReceivedEndpoints" in cand or "frameworkUpdates" in cand:
                                 return cand, sess, prof_idx
-                        wait = min(4.0, 0.75 * attempt)
-                        last_error_note = "YouTube InnerTube returned incomplete payload (retrying)"
+                        wait = min(4.0 if update_shared_state else 1.5, 0.75 * attempt)
+                        if update_shared_state:
+                            last_error_note = "YouTube InnerTube returned incomplete payload (retrying)"
                         logger.debug(
-                            f"YT innertube HTTP 200 incomplete payload (attempt {attempt}/{MAX_RETRIES_PER_PAGE}), rotating client"
+                            f"YT innertube HTTP 200 incomplete payload (attempt {attempt}/{attempts}), rotating client"
                         )
-                        time.sleep(wait)
+                        if attempt < attempts:
+                            time.sleep(wait)
                         _close_quietly(sess)
                         sess, prof_idx = _new_session(prof_idx + 1)
                     elif resp.status_code in (403, 408, 429, 500, 502, 503, 504):
-                        wait = min(5.0, 0.75 * attempt)
-                        last_error_note = f"YouTube InnerTube HTTP {resp.status_code} rate-limited"
+                        wait = min(4.0 if update_shared_state else 1.5, 0.75 * attempt)
+                        if update_shared_state:
+                            last_error_note = f"YouTube InnerTube HTTP {resp.status_code} rate-limited"
                         logger.debug(f"YT innertube HTTP {resp.status_code}, rotating client & sleeping {wait:.1f}s")
-                        time.sleep(wait)
+                        if attempt < attempts:
+                            time.sleep(wait)
                         _close_quietly(sess)
                         sess, prof_idx = _new_session(prof_idx + 1)
                     else:
@@ -788,8 +832,8 @@ async def _collect_via_innertube_curl(
                     logger.debug(f"YT innertube attempt {attempt} error: {exc}")
                     _close_quietly(sess)
                     sess, prof_idx = _new_session(prof_idx + 1)
-                    if attempt < MAX_RETRIES_PER_PAGE:
-                        time.sleep(min(3.0, 0.5 * attempt))
+                    if attempt < attempts:
+                        time.sleep(min(2.0 if update_shared_state else 1.0, 0.5 * attempt))
             return None, sess, prof_idx
 
         def _run_pagination(
@@ -804,9 +848,18 @@ async def _collect_via_innertube_curl(
             page_num = 0
 
             while token and len(comments) < max_items:
-                if token in visited_tokens:
+                if _cancelled():
                     return None
-                visited_tokens.add(token)
+                if (time.monotonic() - started_at) >= max_pagination_secs and len(comments) >= 500:
+                    logger.info(
+                        f"YT innertube [{phase_name}] reached {max_pagination_secs:.0f}s budget cleanly "
+                        f"with {len(comments)} comments"
+                    )
+                    return None
+                tok_k = _tok_key(token)
+                if tok_k in visited_tokens or token in visited_tokens:
+                    return None
+                visited_tokens.add(tok_k)
                 page_num += 1
 
                 data, session, active_profile = _post_with_session(session, active_profile, token)
@@ -869,7 +922,13 @@ async def _collect_via_innertube_curl(
         top_resume_token = _run_pagination(initial_token, "Top", capture_sort=True, max_pages=top_page_cap)
 
         # Phase 2A: Newest comments (fetches full chronological history + replies)
-        if len(comments) < max_items and newest_token and newest_token not in visited_tokens:
+        if (
+            not _cancelled()
+            and len(comments) < max_items
+            and newest_token
+            and _tok_key(newest_token) not in visited_tokens
+            and newest_token not in visited_tokens
+        ):
             logger.info(
                 f"YT innertube switching to Newest sort at {len(comments)}/{max_items} comments"
             )
@@ -877,8 +936,10 @@ async def _collect_via_innertube_curl(
 
         # Phase 2B: Resume Top continuation whenever still below cap or below YouTube's reported volume
         if (
-            len(comments) < max_items
+            not _cancelled()
+            and len(comments) < max_items
             and top_resume_token
+            and _tok_key(top_resume_token) not in visited_tokens
             and top_resume_token not in visited_tokens
             and (est_total == 0 or len(comments) < int(est_total * 0.98))
         ):
@@ -887,8 +948,8 @@ async def _collect_via_innertube_curl(
             )
             _run_pagination(top_resume_token, "Top-Continue", capture_sort=False)
 
-        # Phase 3: Parallel reply threads (uncapped when max_items is uncapped!)
-        if len(comments) < max_items and reply_queue:
+        # Phase 3: Polite parallel reply threads with circuit breaker & wall-clock guard
+        if not _cancelled() and len(comments) < max_items and reply_queue:
             import threading
             from concurrent.futures import ThreadPoolExecutor
 
@@ -897,10 +958,11 @@ async def _collect_via_innertube_curl(
                 f"at {len(comments)}/{max_items}"
             )
             tls = threading.local()
-            worker_sessions: list = []
+            worker_sessions: dict[int, Any] = {}
             sess_lock = threading.Lock()
             worker_base_profile = active_profile
-            max_sub_pages = 500 if max_items >= 1_000_000 else max(25, (max_items // 15) + 5)
+            worker_visitor = visitor_data
+            max_sub_pages = 250 if max_items >= 1_000_000 else max(25, (max_items // 15) + 5)
 
             def _get_worker_state():
                 if not hasattr(tls, "sess"):
@@ -908,34 +970,47 @@ async def _collect_via_innertube_curl(
                     tls.sess = ws
                     tls.prof_idx = w_prof
                     with sess_lock:
-                        worker_sessions.append(ws)
+                        worker_sessions[threading.get_ident()] = ws
                 return tls.sess, tls.prof_idx
 
             def _fetch_reply_thread(rtok: str) -> list[RawComment]:
+                if _cancelled():
+                    return []
                 ws, w_prof = _get_worker_state()
                 thread_comments: list[RawComment] = []
                 local_seen: set[str] = set()
                 pending_rtoks: list[str] = [rtok]
-                local_visited: set[str] = set()
-                seen_sub_reps: set[str] = set()
+                local_visited: set[bytes | str] = set()
+                seen_sub_reps: set[bytes | str] = set()
                 sub_pages = 0
                 per_thread_cap = max(500, max_items - len(comments))
                 while (
-                    pending_rtoks
+                    not _cancelled()
+                    and pending_rtoks
                     and sub_pages < max_sub_pages
                     and len(thread_comments) < per_thread_cap
                 ):
                     cur_tok = pending_rtoks.pop(0)
-                    if not cur_tok or cur_tok in local_visited:
+                    if not cur_tok:
                         continue
-                    local_visited.add(cur_tok)
+                    cur_k = _tok_key(cur_tok)
+                    if cur_k in local_visited or cur_tok in local_visited:
+                        continue
+                    local_visited.add(cur_k)
                     sub_pages += 1
-                    data, ws, w_prof = _post_with_session(ws, w_prof, cur_tok)
+                    data, ws, w_prof = _post_with_session(
+                        ws,
+                        w_prof,
+                        cur_tok,
+                        max_attempts=2,
+                        req_timeout=12,
+                        update_shared_state=False,
+                        fixed_visitor=worker_visitor,
+                    )
                     tls.sess = ws
                     tls.prof_idx = w_prof
                     with sess_lock:
-                        if ws not in worker_sessions:
-                            worker_sessions.append(ws)
+                        worker_sessions[threading.get_ident()] = ws
                     if data is None:
                         continue
                     items, _, next_rtok, nested_reps = _extract_innertube_page(
@@ -950,25 +1025,38 @@ async def _collect_via_innertube_curl(
                         seen_reply_tokens=seen_sub_reps,
                     )
                     thread_comments.extend(items)
-                    if next_rtok and next_rtok not in local_visited:
-                        pending_rtoks.insert(0, next_rtok)
+                    if next_rtok:
+                        nk = _tok_key(next_rtok)
+                        if nk not in local_visited and next_rtok not in local_visited:
+                            pending_rtoks.insert(0, next_rtok)
                     for nr in nested_reps:
-                        if nr and nr not in local_visited:
-                            pending_rtoks.append(nr)
+                        if nr:
+                            nrk = _tok_key(nr)
+                            if nrk not in local_visited and nr not in local_visited:
+                                pending_rtoks.append(nr)
                 return thread_comments
 
             try:
-                batch_size = 40
-                with ThreadPoolExecutor(max_workers=10) as pool:
+                batch_size = 24
+                p3_started = time.monotonic()
+                consecutive_empty_batches = 0
+                with ThreadPoolExecutor(max_workers=4) as pool:
                     for b_start in range(0, len(reply_queue), batch_size):
-                        if len(comments) >= max_items:
+                        if _cancelled() or len(comments) >= max_items:
+                            break
+                        if (time.monotonic() - p3_started) >= max_phase3_secs:
+                            logger.info(
+                                f"YT innertube Phase 3 reply budget ({max_phase3_secs:.0f}s) reached "
+                                f"with {len(comments)} comments collected"
+                            )
                             break
                         batch = [
                             t for t in reply_queue[b_start : b_start + batch_size]
-                            if t not in visited_tokens
+                            if _tok_key(t) not in visited_tokens and t not in visited_tokens
                         ]
                         for t in batch:
-                            visited_tokens.add(t)
+                            visited_tokens.add(_tok_key(t))
+                        added_in_batch = 0
                         for thread_items in pool.map(_fetch_reply_thread, batch):
                             for item in thread_items:
                                 if len(comments) >= max_items:
@@ -976,8 +1064,19 @@ async def _collect_via_innertube_curl(
                                 if item.comment_id not in seen_ids:
                                     seen_ids.add(item.comment_id)
                                     comments.append(item)
+                                    added_in_batch += 1
+                        if batch and added_in_batch == 0:
+                            consecutive_empty_batches += 1
+                            if consecutive_empty_batches >= 2:
+                                logger.info(
+                                    f"YT innertube Phase 3 stopped after {consecutive_empty_batches} consecutive empty/rate-limited batches "
+                                    f"(kept {len(comments)} comments)"
+                                )
+                                break
+                        else:
+                            consecutive_empty_batches = 0
             finally:
-                for ws in worker_sessions:
+                for ws in worker_sessions.values():
                     _close_quietly(ws)
 
         _close_quietly(session)
@@ -1026,7 +1125,8 @@ async def _collect_via_downloader(
         d.session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
         d.session.cookies.set("SOCS", "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg", domain=".youtube.com")
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
-        max_c = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
+        req_max = effective_max_comments(is_target=source.is_target)
+        max_c = req_max if req_max > 0 else None
         results: list[dict] = []
         for sort_mode in (1, 0):
             try:
@@ -1085,12 +1185,13 @@ async def _collect_via_ytdlp(
         return [], source
 
     def _call():
+        req_max = effective_max_comments(is_target=source.is_target)
         yt_args: dict[str, Any] = {
             "player_client": ["visionos", "mweb", "tv_embedded", "android", "ios", "web"],
         }
-        if settings.max_comments_per_url > 0:
+        if req_max > 0:
             yt_args["max_comments"] = [
-                str(settings.max_comments_per_url),
+                str(req_max),
                 "all",
                 "all",
                 "all",
@@ -1112,7 +1213,8 @@ async def _collect_via_ytdlp(
         info = await asyncio.to_thread(_call)
         raw_list = (info or {}).get("comments") or []
         comments: list[RawComment] = []
-        limit = settings.max_comments_per_url if settings.max_comments_per_url > 0 else None
+        req_max = effective_max_comments(is_target=source.is_target)
+        limit = req_max if req_max > 0 else None
         for i, c in enumerate(raw_list[:limit]):
             text = (c.get("text") or "").strip()
             if not text:
@@ -1152,7 +1254,8 @@ async def _collect_via_api(
         youtube = build("youtube", "v3", developerKey=settings.youtube_api_key)
         comments: list[RawComment] = []
         page_token = None
-        max_items = settings.max_comments_per_url if settings.max_comments_per_url > 0 else 1000000
+        req_max = effective_max_comments(is_target=source.is_target)
+        max_items = req_max if req_max > 0 else 1000000
 
         while len(comments) < max_items:
             request_kwargs: dict = {
